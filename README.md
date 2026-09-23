@@ -76,15 +76,18 @@ Please follow the instructions in the file [INSTALL.md](INSTALL.md).
 
 Please read the file [Getting-Started.md](Getting-Started.md).
 
-The `FES8_PADE` discretization includes direct-Cayley and dependency-free
-Chebyshev--Joukowski representations for the continuous spectrum. The global
-power-basis polynomials of the direct-Cayley representation can become
-ill-conditioned on fine grids, as discussed in the cited arXiv preprint. The
-Chebyshev representation builds its coefficients in
-O(K D log<sup>2</sup>D), but evaluating them by Clenshaw's recurrence on the
-uniform spectral grid of `fnft_nsev` requires O(M K D) operations. Thus,
-without an optional nonuniform fast transform, this dependency-free path is
-not an end-to-end O(D log<sup>2</sup>D) algorithm when M is proportional to D.
+The `FES8_PADE` discretization includes direct-Cayley and
+Chebyshev--Joukowski representations for the continuous spectrum. Build with
+`-DENABLE_NFFT=ON` to use NFFT3 for the final polynomial evaluation in both
+representations and in the other Padé families. For fixed Padé degree and
+transform accuracy, the complete continuous-spectrum computation costs
+O(D log<sup>2</sup>D + M), hence O(D log<sup>2</sup>D) for M = O(D).
+Without NFFT3, Horner/Clenshaw evaluation costs O(M K D), where K is the
+local polynomial degree. Installation details are in [INSTALL.md](INSTALL.md).
+NFFT3 does not remove the poor conditioning that the direct-Cayley global
+power-basis polynomials can exhibit on fine grids.
+For eighth-order accuracy with `FES8_PADE`, explicitly set `pade_degree` to
+4 or higher; the default degree 3 has sixth-order accuracy.
 The Chebyshev representation is used only for continuous-spectrum polynomial
 evaluation. Bound states, norming constants and residues requested with
 `FES8_PADE` are computed through the slow `ES8` refinement path. `NEWTON`

@@ -96,6 +96,27 @@ FNFT_INT fnft__nse_scatter_bound_states(FNFT_UINT const D,
                                         FNFT_UINT const skip_b_flag);
 
 /**
+ * @brief Padé variant of \link fnft__nse_scatter_bound_states \endlink for
+ * ES4/ES6/ES8.
+ *
+ * @param[in] pade_degree Degree of the diagonal Padé approximant, from 1
+ * through 7.
+ */
+FNFT_INT fnft__nse_scatter_bound_states_pade(FNFT_UINT const D,
+                                        FNFT_COMPLEX const * const q,
+                                        FNFT_COMPLEX const * const r,
+                                        FNFT_REAL const * const T,
+                                        FNFT_UINT const K,
+                                        FNFT_COMPLEX * const bound_states,
+                                        FNFT_COMPLEX * const a_vals,
+                                        FNFT_COMPLEX * const aprime_vals,
+                                        FNFT_COMPLEX * const b,
+                                        FNFT_INT * const Ws,
+                                        fnft_nse_discretization_t const discretization,
+                                        FNFT_UINT const pade_degree,
+                                        FNFT_UINT const skip_b_flag);
+
+/**
  * @brief Computes the scattering matrix and its derivative.
  *
  * The function computes the scattering matrix and the derivative of the scattering matrix with
@@ -147,9 +168,31 @@ FNFT_INT fnft__nse_scatter_matrix(const FNFT_UINT D,
         fnft_nse_discretization_t const discretization,
         const FNFT_UINT derivative_flag);
 
+/**
+ * @brief Padé variant of \link fnft__nse_scatter_matrix \endlink for
+ * ES4/ES6/ES8.
+ *
+ * @param[in] pade_degree Degree of the diagonal Padé approximant, from 1
+ * through 7.
+ */
+FNFT_INT fnft__nse_scatter_matrix_pade(const FNFT_UINT D,
+        FNFT_COMPLEX const * const q,
+        FNFT_COMPLEX const * const r,
+        const FNFT_REAL eps_t,
+        const FNFT_INT kappa,
+        const FNFT_UINT K,
+        FNFT_COMPLEX const * const lambda,
+        FNFT_COMPLEX * const result,
+        FNFT_INT * const W,
+        fnft_nse_discretization_t const discretization,
+        const FNFT_UINT pade_degree,
+        const FNFT_UINT derivative_flag);
+
 #ifdef FNFT_ENABLE_SHORT_NAMES
 #define nse_scatter_bound_states(...) fnft__nse_scatter_bound_states(__VA_ARGS__)
+#define nse_scatter_bound_states_pade(...) fnft__nse_scatter_bound_states_pade(__VA_ARGS__)
 #define nse_scatter_matrix(...) fnft__nse_scatter_matrix(__VA_ARGS__)
+#define nse_scatter_matrix_pade(...) fnft__nse_scatter_matrix_pade(__VA_ARGS__)
 #endif
 
 #endif

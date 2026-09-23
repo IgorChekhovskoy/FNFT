@@ -18,6 +18,7 @@
 * Shrinivas Chimmalgi (TU Delft) 2017-2020.
 * Peter J. Prins (TU Delft) 2021.
 * Sander Wahls (KIT), 2023.
+* Igor Chekhovskoy (NSU, FRC ICT) 2026.
 */
 
 /**
@@ -30,10 +31,52 @@
 #define FNFT__AKNS_SCATTER_H
 
 #include "fnft__akns_discretization.h"
+#include <float.h>
 #include <stdio.h>
 #include <string.h> // for memcpy
 #include "fnft__errwarn.h"
 #include "fnft__misc.h"// for square_matrix_mult
+
+/* Internal exact ES scalar kernel. It is inline so the production scatterer
+ * and its direct numerical oracle exercise one implementation without adding
+ * an exported private symbol. */
+static inline void fnft__akns_scatter_exact_scalar_pair(
+        FNFT_COMPLEX const root, FNFT_COMPLEX * const f,
+        FNFT_COMPLEX * const g)
+{
+    const FNFT_REAL root_real = FNFT_CREAL(root);
+    const FNFT_REAL root_imag = FNFT_CIMAG(root);
+    const FNFT_REAL safe_real_limit = FNFT_LOG(DBL_MAX)-8.0;
+
+    if (isfinite(root_real) && isfinite(root_imag)
+            && FNFT_FABS(root_real) <= safe_real_limit) {
+        const FNFT_REAL sin_imag = FNFT_SIN(root_imag);
+        const FNFT_REAL cos_imag = FNFT_COS(root_imag);
+        const FNFT_REAL sinh_real = FNFT_SINH(root_real);
+        const FNFT_REAL cosh_real = FNFT_COSH(root_real);
+        const FNFT_COMPLEX f_candidate = cosh_real*cos_imag
+                +(FNFT_COMPLEX)I*(sinh_real*sin_imag);
+        FNFT_COMPLEX g_candidate = (sinh_real*cos_imag
+                +(FNFT_COMPLEX)I*(cosh_real*sin_imag))/root;
+
+        if (root_real == 0.0 && root_imag != 0.0) {
+            g_candidate = (FNFT_COMPLEX)(sin_imag/root_imag);
+            if (root_imag > 0.0)
+                g_candidate = FNFT_CONJ(g_candidate);
+        }
+
+        if (isfinite(FNFT_CREAL(f_candidate))
+                && isfinite(FNFT_CIMAG(f_candidate))
+                && isfinite(FNFT_CREAL(g_candidate))
+                && isfinite(FNFT_CIMAG(g_candidate))) {
+            *f = f_candidate;
+            *g = g_candidate;
+            return;
+        }
+    }
+    *f = FNFT_CCOSH(root);
+    *g = fnft__misc_CSINC((FNFT_COMPLEX)I*root);
+}
 
 
 /**
@@ -89,6 +132,46 @@ FNFT_INT fnft__akns_scatter_matrix(FNFT_UINT const D,
                                    fnft__akns_pde_t const PDE,
                                    FNFT_UINT const vanilla_flag,
                                    FNFT_UINT const derivative_flag);
+
+/**
+ * @brief Padé variant of \link fnft__akns_scatter_matrix \endlink for
+ * ES4/ES6/ES8.
+ *
+ * @param[in] pade_degree Degree of the diagonal Padé approximant, from 1
+ * through 7.
+ */
+FNFT_INT fnft__akns_scatter_matrix_pade(FNFT_UINT const D,
+                                   FNFT_COMPLEX const * const q,
+                                   FNFT_COMPLEX const * const r,
+                                   FNFT_REAL const eps_t,
+                                   FNFT_UINT const K,
+                                   FNFT_COMPLEX const * const lambda,
+                                   FNFT_COMPLEX * const result,
+                                   FNFT_INT * const W,
+                                   fnft__akns_discretization_t discretization,
+                                   fnft__akns_pde_t const PDE,
+                                   FNFT_UINT const vanilla_flag,
+                                   FNFT_UINT const pade_degree,
+                                   FNFT_UINT const derivative_flag);
+
+/**
+ * @brief Computes the first column of a slow ES scattering matrix.
+ *
+ * This internal routine is restricted to the NSE reduction, real spectral
+ * points and ES4/ES6/ES8. The Padé degree is zero for the exact exponential
+ * and between one and seven for a diagonal Padé approximation.
+ */
+FNFT_INT fnft__akns_scatter_matrix_first_column(FNFT_UINT const D,
+                                   FNFT_COMPLEX const * const q,
+                                   FNFT_COMPLEX const * const r,
+                                   FNFT_REAL const eps_t,
+                                   FNFT_UINT const K,
+                                   FNFT_COMPLEX const * const lambda,
+                                   FNFT_COMPLEX * const H11,
+                                   FNFT_COMPLEX * const H21,
+                                   FNFT_INT * const W,
+                                   fnft__akns_discretization_t discretization,
+                                   FNFT_UINT const pade_degree);
 
 
 /**
@@ -156,8 +239,35 @@ FNFT_INT akns_scatter_bound_states(FNFT_UINT const D,
                                    FNFT_UINT const vanilla_flag,
                                    FNFT_UINT const skip_b_flag);
 
+/**
+ * @brief Padé variant of \link akns_scatter_bound_states \endlink for
+ * ES4/ES6/ES8.
+ *
+ * @param[in] pade_degree Degree of the diagonal Padé approximant, from 1
+ * through 7.
+ */
+FNFT_INT fnft__akns_scatter_bound_states_pade(FNFT_UINT const D,
+                                   FNFT_COMPLEX const * const q,
+                                   FNFT_COMPLEX const * const r,
+                                   FNFT_REAL const *const T,
+                                   FNFT_UINT const K,
+                                   FNFT_COMPLEX const * const bound_states,
+                                   FNFT_COMPLEX * const a_vals,
+                                   FNFT_COMPLEX * const aprime_vals,
+                                   FNFT_COMPLEX * const b_vals,
+                                   FNFT_INT * Ws,
+                                   fnft__akns_discretization_t const discretization,
+                                   fnft__akns_pde_t const PDE,
+                                   FNFT_UINT const vanilla_flag,
+                                   FNFT_UINT const pade_degree,
+                                   FNFT_UINT const skip_b_flag);
+
 #ifdef FNFT_ENABLE_SHORT_NAMES
 #define akns_scatter_matrix(...) fnft__akns_scatter_matrix(__VA_ARGS__)
+#define akns_scatter_matrix_pade(...) fnft__akns_scatter_matrix_pade(__VA_ARGS__)
+#define akns_scatter_matrix_first_column(...) \
+    fnft__akns_scatter_matrix_first_column(__VA_ARGS__)
+#define akns_scatter_bound_states_pade(...) fnft__akns_scatter_bound_states_pade(__VA_ARGS__)
 #endif
 
 #endif

@@ -104,6 +104,18 @@ UINT fnft__nse_discretization_effective_order(
 {
     const UINT base_order = nse_discretization_method_order(discretization);
 
+    if (discretization == nse_discretization_ES4
+            || discretization == nse_discretization_ES6
+            || discretization == nse_discretization_ES8) {
+        const UINT pade_order = 2*requested_degree;
+
+        if (requested_degree > 7 || base_order == 0)
+            return 0;
+        if (requested_degree == 0)
+            return base_order;
+        return pade_order < base_order ? pade_order : base_order;
+    }
+
     if (!nse_discretization_is_pade(discretization))
         return base_order;
     {

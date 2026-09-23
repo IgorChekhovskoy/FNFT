@@ -192,9 +192,18 @@ static INT test_zero_signal(const nse_discretization_t discretization,
     if (ret_code != SUCCESS)
         return ret_code;
     for (i = 0; i < M; i++) {
-        if (FNFT_CABS(spectrum[i]) > 2e-11
-                || FNFT_FABS(FNFT_CABS(spectrum[M + i]) - 1.0) > 2e-11
-                || FNFT_CABS(spectrum[2*M + i]) > 2e-11) {
+        const REAL rho_error = FNFT_CABS(spectrum[i]);
+        const REAL a_error = FNFT_FABS(FNFT_CABS(spectrum[M + i])-1.0);
+        const REAL b_error = FNFT_CABS(spectrum[2*M + i]);
+        if (!isfinite(CREAL(spectrum[i]))
+                || !isfinite(CIMAG(spectrum[i]))
+                || !isfinite(CREAL(spectrum[M+i]))
+                || !isfinite(CIMAG(spectrum[M+i]))
+                || !isfinite(CREAL(spectrum[2*M+i]))
+                || !isfinite(CIMAG(spectrum[2*M+i]))
+                || !isfinite(rho_error) || !isfinite(a_error)
+                || !isfinite(b_error) || !(rho_error <= 2e-11)
+                || !(a_error <= 2e-11) || !(b_error <= 2e-11)) {
             fprintf(stderr, "Padé zero-signal failure: degree=%lu kappa=%d norm=%d i=%lu rho=%.3e a=(%.6e,%.6e) b=%.3e\n",
                     (unsigned long)pade_degree, (int)kappa,
                     (int)normalization_flag, (unsigned long)i,
@@ -238,10 +247,21 @@ static REAL continuous_spectrum_error(const nsev_testcases_t testcase,
     if (*ret_code != SUCCESS)
         goto release_mem;
     for (i = 0; i < M; i++) {
-        error += FNFT_CABS(computed[i] - exact[i]);
-        norm += FNFT_CABS(exact[i]);
+        const REAL point_error = FNFT_CABS(computed[i]-exact[i]);
+        const REAL point_norm = FNFT_CABS(exact[i]);
+        if (!isfinite(CREAL(computed[i]))
+                || !isfinite(CIMAG(computed[i]))
+                || !isfinite(CREAL(exact[i])) || !isfinite(CIMAG(exact[i]))
+                || !isfinite(point_error) || !isfinite(point_norm)) {
+            *ret_code = E_TEST_FAILED;
+            goto release_mem;
+        }
+        error += point_error;
+        norm += point_norm;
     }
     error /= 1.0 + norm;
+    if (!isfinite(error))
+        *ret_code = E_TEST_FAILED;
 
 release_mem:
     free(q);
@@ -252,6 +272,145 @@ release_mem:
     free(residues);
     free(computed);
     return error;
+}
+
+static INT test_fast_slow_es8_agreement(const nsev_testcases_t testcase,
+        const UINT D, const UINT pade_degree)
+{
+    COMPLEX *q = NULL, *exact = NULL, *ab = NULL, *bound_states = NULL;
+    COMPLEX *normconsts = NULL, *residues = NULL;
+    COMPLEX *fast = NULL, *slow = NULL;
+    REAL T[2], XI[2], difference = 0.0, slow_error = 0.0;
+    REAL exact_norm = 0.0;
+    UINT M, K, i;
+    INT kappa, ret_code;
+    fnft_nsev_opts_t opts = fnft_nsev_default_opts();
+
+    ret_code = nsev_testcases(testcase, D, &q, T, &M, &exact, &ab, XI,
+            &K, &bound_states, &normconsts, &residues, &kappa);
+    if (ret_code != SUCCESS)
+        goto release_mem;
+    fast = malloc(M*sizeof(COMPLEX));
+    slow = malloc(M*sizeof(COMPLEX));
+    if (fast == NULL || slow == NULL) {
+        ret_code = E_NOMEM;
+        goto release_mem;
+    }
+
+    opts.contspec_type = nsev_cstype_REFLECTION_COEFFICIENT;
+    opts.discretization = nse_discretization_FES8_PADE;
+    opts.pade_degree = pade_degree;
+    /* Use the stable fast representation on this fine grid. The documented
+     * global direct-Cayley power basis is ill-conditioned here and therefore
+     * cannot serve as a propagation cross-check. */
+    opts.pade_representation = nsev_pade_representation_CHEBYSHEV_JOUKOWSKI;
+    ret_code = fnft_nsev(D, q, T, M, fast, XI, NULL, NULL, NULL,
+            kappa, &opts);
+    if (ret_code != SUCCESS)
+        goto release_mem;
+    opts.discretization = nse_discretization_ES8;
+    opts.pade_degree = pade_degree;
+    opts.pade_representation = nsev_pade_representation_DIRECT_CAYLEY;
+    ret_code = fnft_nsev(D, q, T, M, slow, XI, NULL, NULL, NULL,
+            kappa, &opts);
+    if (ret_code != SUCCESS)
+        goto release_mem;
+
+    for (i = 0; i < M; i++) {
+        if (!isfinite(CREAL(fast[i])) || !isfinite(CIMAG(fast[i]))
+                || !isfinite(CREAL(slow[i])) || !isfinite(CIMAG(slow[i]))
+                || !isfinite(CREAL(exact[i]))
+                || !isfinite(CIMAG(exact[i]))) {
+            fprintf(stderr, "FES8/ES8 cross-check nonfinite value at i=%lu\n",
+                    (unsigned long)i);
+            ret_code = E_TEST_FAILED;
+            goto release_mem;
+        }
+        difference += CABS(fast[i] - slow[i]);
+        slow_error += CABS(slow[i] - exact[i]);
+        exact_norm += CABS(exact[i]);
+    }
+    /* Use the same exact-spectrum L1 normalization for both errors. Slow ES8
+     * shares the local-coefficient generator with FES8, but is independent in
+     * propagation/product and polynomial evaluation. At D=512 and degree 5,
+     * Padé implementations must agree within 2% of the slow discretization
+     * error; the absolute 1e-12 term only covers the roundoff floor. */
+    difference /= 1.0 + exact_norm;
+    slow_error /= 1.0 + exact_norm;
+    if (!isfinite(difference) || !isfinite(slow_error)
+            || !(difference <= 0.02*slow_error + 1e-12)) {
+        fprintf(stderr, "FES8/ES8 cross-check failure: degree=%lu difference=%.3e slow_error=%.3e\n",
+                (unsigned long)pade_degree, difference, slow_error);
+        ret_code = E_TEST_FAILED;
+    }
+
+release_mem:
+    free(q);
+    free(exact);
+    free(ab);
+    free(bound_states);
+    free(normconsts);
+    free(residues);
+    free(fast);
+    free(slow);
+    return ret_code;
+}
+
+static INT test_slow_es8_pointwise(const nsev_testcases_t testcase)
+{
+    const UINT D = 64, pade_degree = 5;
+    COMPLEX *q = NULL, *exact = NULL, *ab = NULL, *bound_states = NULL;
+    COMPLEX *normconsts = NULL, *residues = NULL, *slow = NULL;
+    REAL T[2], XI[2], difference = 0.0, reference_norm = 0.0;
+    UINT M, K, i;
+    INT kappa, ret_code;
+    fnft_nsev_opts_t opts = fnft_nsev_default_opts();
+
+    ret_code = nsev_testcases(testcase, D, &q, T, &M, &exact, &ab, XI,
+            &K, &bound_states, &normconsts, &residues, &kappa);
+    if (ret_code != SUCCESS)
+        goto release_mem;
+    slow = malloc(M*sizeof(COMPLEX));
+    if (slow == NULL) {
+        ret_code = E_NOMEM;
+        goto release_mem;
+    }
+    opts.discretization = nse_discretization_ES8;
+    opts.pade_degree = pade_degree;
+    ret_code = fnft_nsev(D, q, T, M, slow, XI, NULL, NULL, NULL,
+            kappa, &opts);
+    if (ret_code != SUCCESS)
+        goto release_mem;
+    for (i = 0; i < M; i++) {
+        const COMPLEX lambda = XI[0] +(XI[1]-XI[0])*i/(M-1);
+        const COMPLEX reference = pointwise_reflection(D,q,T,lambda,kappa,
+                pade_degree);
+
+        if (!isfinite(CREAL(slow[i])) || !isfinite(CIMAG(slow[i]))
+                || !isfinite(CREAL(reference))
+                || !isfinite(CIMAG(reference))) {
+            ret_code = E_TEST_FAILED;
+            goto release_mem;
+        }
+        difference += CABS(slow[i]-reference);
+        reference_norm += CABS(reference);
+    }
+    difference /= 1.0+reference_norm;
+    if (!isfinite(difference) || !(difference < 2e-12)) {
+        fprintf(stderr, "Slow ES8 Padé-5 pointwise mismatch: %.3e\n",
+                difference);
+        ret_code = E_TEST_FAILED;
+    }
+
+release_mem:
+    free(q);
+    free(exact);
+    free(ab);
+    free(bound_states);
+    free(normconsts);
+    free(residues);
+    free(slow);
+    return ret_code;
 }
 
 static REAL pointwise_spectrum_error(const nsev_testcases_t testcase,
@@ -272,7 +431,9 @@ static REAL pointwise_spectrum_error(const nsev_testcases_t testcase,
         const COMPLEX computed = pointwise_reflection(D, q, T, lambda,
                 kappa, pade_degree);
 
-        if (isnan(CREAL(computed)) || isnan(CIMAG(computed))) {
+        if (!isfinite(CREAL(computed)) || !isfinite(CIMAG(computed))
+                || !isfinite(CREAL(exact[i]))
+                || !isfinite(CIMAG(exact[i]))) {
             *ret_code = E_TEST_FAILED;
             goto release_mem;
         }
@@ -280,6 +441,8 @@ static REAL pointwise_spectrum_error(const nsev_testcases_t testcase,
         norm += CABS(exact[i]);
     }
     error /= 1.0 + norm;
+    if (!isfinite(error))
+        *ret_code = E_TEST_FAILED;
 
 release_mem:
     free(q);
@@ -327,8 +490,14 @@ static INT test_public_es8_small_grid(void)
                     const COMPLEX expected = pointwise_reflection(D, q, T,
                             XI[0] + (XI[1] - XI[0])*i/(M - 1), kappa,
                             opts.pade_degree);
-                    if (CABS(computed[i] - expected)
-                            > 2e-9*(1.0 + CABS(expected))) {
+                    const REAL error = CABS(computed[i]-expected);
+                    const REAL tolerance = 2e-9*(1.0+CABS(expected));
+                    if (!isfinite(CREAL(computed[i]))
+                            || !isfinite(CIMAG(computed[i]))
+                            || !isfinite(CREAL(expected))
+                            || !isfinite(CIMAG(expected))
+                            || !isfinite(error) || !isfinite(tolerance)
+                            || !(error <= tolerance)) {
                         fprintf(stderr, "FES8 public small-grid mismatch: degree=%lu kappa=%d norm=%d i=%lu error=%.3e\n",
                                 (unsigned long)opts.pade_degree, (int)kappa,
                                 (int)normalization_flag, (unsigned long)i,
@@ -377,8 +546,14 @@ static INT test_public_es8_chebyshev(void)
                     const COMPLEX expected = pointwise_reflection(D, q, T,
                             lambda, kappa, opts.pade_degree);
                     const REAL tolerance = 4e-8*(1.0 + CABS(expected));
+                    const REAL error = CABS(computed[i]-expected);
 
-                    if (CABS(computed[i] - expected) > tolerance) {
+                    if (!isfinite(CREAL(computed[i]))
+                            || !isfinite(CIMAG(computed[i]))
+                            || !isfinite(CREAL(expected))
+                            || !isfinite(CIMAG(expected))
+                            || !isfinite(error) || !isfinite(tolerance)
+                            || !(error <= tolerance)) {
                         fprintf(stderr, "FES8 public Chebyshev mismatch: degree=%lu kappa=%d norm=%d i=%lu error=%.3e\n",
                                 (unsigned long)opts.pade_degree, (int)kappa,
                                 (int)normalization_flag, (unsigned long)i,
@@ -411,6 +586,11 @@ static INT test_public_es8_rejections(void)
     if (fnft_nsev(D, q, T, M, spectrum, XI, NULL, NULL, NULL, +1,
                 &opts) == SUCCESS)
         return E_TEST_FAILED;
+    opts.discretization = nse_discretization_ES8;
+    if (fnft_nsev(D, q, T, M, spectrum, XI, NULL, NULL, NULL, +1,
+                &opts) == SUCCESS)
+        return E_TEST_FAILED;
+    opts.discretization = nse_discretization_FES8_PADE;
     opts.pade_degree = 3;
     opts.pade_h = -1.0;
     if (fnft_nsev(D, q, T, M, spectrum, XI, NULL, NULL, NULL, +1,
@@ -427,6 +607,9 @@ static INT test_public_es8_rejections(void)
     K = 1;
     if (fnft_nsev(D, q, T, 0, NULL, NULL, &K, NULL, NULL, +1,
                 &opts) != SUCCESS || K != 0)
+        return E_TEST_FAILED;
+    if (fnft_nsev(D, q, T, 0, spectrum, NULL, NULL, NULL, NULL, +1,
+                &opts) != SUCCESS)
         return E_TEST_FAILED;
     opts.pade_representation =
             nsev_pade_representation_CHEBYSHEV_JOUKOWSKI;
@@ -479,6 +662,16 @@ static INT test_es8_metadata(void)
                 nse_discretization_FES8_PADE, 7) != 8
             || nse_discretization_effective_order(
                 nse_discretization_FES8_PADE, 2) != 0
+            || nse_discretization_effective_order(
+                nse_discretization_ES4, 0) != 4
+            || nse_discretization_effective_order(
+                nse_discretization_ES4, 1) != 2
+            || nse_discretization_effective_order(
+                nse_discretization_ES6, 2) != 4
+            || nse_discretization_effective_order(
+                nse_discretization_ES8, 5) != 8
+            || nse_discretization_effective_order(
+                nse_discretization_ES8, 8) != 0
             || FABS(nse_discretization_pade_h(
                 nse_discretization_FES8_PADE, 3, 0.0) - 14.9) > EPSILON
             || FABS(nse_discretization_pade_h(
@@ -530,12 +723,14 @@ static INT test_es8_metadata(void)
 
 static INT test_es8_pointwise_convergence(const nsev_testcases_t testcase)
 {
-    REAL errors[2][3], slow_error;
+    REAL errors[2][3];
     const UINT degrees[2] = {3, 4};
     const UINT grids[3] = {128, 256, 512};
     UINT degree_index, grid_index;
     INT ret_code;
 
+    /* The pointwise reference multiplies the FES8 Padé steps directly and is
+     * independent of the fast polynomial product used by fnft_nsev. */
     for (degree_index = 0; degree_index < 2; degree_index++) {
         for (grid_index = 0; grid_index < 3; grid_index++) {
             errors[degree_index][grid_index] = pointwise_spectrum_error(
@@ -561,17 +756,9 @@ static INT test_es8_pointwise_convergence(const nsev_testcases_t testcase)
                 errors[1][0]/errors[1][1], errors[1][1]/errors[1][2]);
         return E_TEST_FAILED;
     }
-    slow_error = continuous_spectrum_error(testcase, grids[2],
-            nse_discretization_ES8, 0,
-            nsev_pade_representation_DIRECT_CAYLEY, &ret_code);
+    ret_code = test_fast_slow_es8_agreement(testcase, grids[2], 5);
     if (ret_code != SUCCESS)
         return ret_code;
-    if (FABS(errors[1][2] - slow_error)
-            > 0.02*slow_error + 1e-12) {
-        fprintf(stderr, "FES8 pointwise/slow mismatch: Pade=%.3e slow=%.3e\n",
-                errors[1][2], slow_error);
-        return E_TEST_FAILED;
-    }
     return SUCCESS;
 }
 
@@ -673,6 +860,14 @@ static REAL bound_state_error(const UINT D,
         REAL minimum = INFINITY;
         for (j = 0; j < K_exact; j++) {
             const REAL distance = FNFT_CABS(computed[i] - bound_states[j]);
+            if (!isfinite(FNFT_CREAL(computed[i]))
+                    || !isfinite(FNFT_CIMAG(computed[i]))
+                    || !isfinite(FNFT_CREAL(bound_states[j]))
+                    || !isfinite(FNFT_CIMAG(bound_states[j]))
+                    || !isfinite(distance)) {
+                *ret_code = E_TEST_FAILED;
+                goto release_mem;
+            }
             if (distance < minimum)
                 minimum = distance;
         }
@@ -754,27 +949,58 @@ static INT test_es8_degree7_discrete_data(void)
         goto release_mem;
     }
     for (i = 0; i < K; i++) {
-        if (CABS(bound_states[i] - bound_states_exact[i])
-                > 2e-5*(1.0 + CABS(bound_states_exact[i]))) {
+        const REAL bound_state_error = CABS(
+                bound_states[i]-bound_states_exact[i]);
+        const REAL bound_state_tolerance = 2e-5
+                *(1.0+CABS(bound_states_exact[i]));
+        const REAL normconst_point_error = CABS(
+                data[i]-normconsts_exact[i]);
+        const REAL normconst_point_norm = CABS(normconsts_exact[i]);
+        const REAL residue_point_error = CABS(
+                data[K+i]-residues_exact[i]);
+        const REAL residue_point_norm = CABS(residues_exact[i]);
+        if (!isfinite(CREAL(bound_states[i]))
+                || !isfinite(CIMAG(bound_states[i]))
+                || !isfinite(CREAL(bound_states_exact[i]))
+                || !isfinite(CIMAG(bound_states_exact[i]))
+                || !isfinite(bound_state_error)
+                || !isfinite(bound_state_tolerance)
+                || !(bound_state_error <= bound_state_tolerance)) {
             fprintf(stderr, "FES8 degree-7 bound-state mismatch: i=%lu error=%.3e computed=(%.16e,%.16e) exact=(%.16e,%.16e)\n",
                     (unsigned long)i,
-                    CABS(bound_states[i] - bound_states_exact[i]),
+                    bound_state_error,
                     CREAL(bound_states[i]), CIMAG(bound_states[i]),
                     CREAL(bound_states_exact[i]),
                     CIMAG(bound_states_exact[i]));
             ret_code = E_TEST_FAILED;
             goto release_mem;
         }
-        normconst_error += CABS(data[i] - normconsts_exact[i]);
-        normconst_norm += CABS(normconsts_exact[i]);
-        residue_error += CABS(data[K + i] - residues_exact[i]);
-        residue_norm += CABS(residues_exact[i]);
+        if (!isfinite(CREAL(data[i])) || !isfinite(CIMAG(data[i]))
+                || !isfinite(CREAL(normconsts_exact[i]))
+                || !isfinite(CIMAG(normconsts_exact[i]))
+                || !isfinite(CREAL(data[K+i]))
+                || !isfinite(CIMAG(data[K+i]))
+                || !isfinite(CREAL(residues_exact[i]))
+                || !isfinite(CIMAG(residues_exact[i]))
+                || !isfinite(normconst_point_error)
+                || !isfinite(normconst_point_norm)
+                || !isfinite(residue_point_error)
+                || !isfinite(residue_point_norm)) {
+            ret_code = E_TEST_FAILED;
+            goto release_mem;
+        }
+        normconst_error += normconst_point_error;
+        normconst_norm += normconst_point_norm;
+        residue_error += residue_point_error;
+        residue_norm += residue_point_norm;
     }
-    if (normconst_error/(1.0 + normconst_norm) > 2e-4
-            || residue_error/(1.0 + residue_norm) > 2e-4) {
+    normconst_error /= 1.0+normconst_norm;
+    residue_error /= 1.0+residue_norm;
+    if (!isfinite(normconst_error) || !isfinite(residue_error)
+            || !(normconst_error <= 2e-4)
+            || !(residue_error <= 2e-4)) {
         fprintf(stderr, "FES8 degree-7 discrete-data mismatch: normconst=%.3e residue=%.3e\n",
-                normconst_error/(1.0 + normconst_norm),
-                residue_error/(1.0 + residue_norm));
+                normconst_error,residue_error);
         ret_code = E_TEST_FAILED;
     }
 
@@ -787,6 +1013,99 @@ release_mem:
     free(residues_exact);
     free(bound_states);
     free(data);
+    return ret_code;
+}
+
+static INT test_slow_es8_pade5_discrete_data(void)
+{
+    const UINT D = 256;
+    COMPLEX *q = NULL, *exact = NULL, *ab = NULL;
+    COMPLEX *bound_states_exact = NULL, *normconsts = NULL, *residues = NULL;
+    COMPLEX *bound_states_exp = NULL, *bound_states_pade = NULL;
+    COMPLEX *data_exp = NULL, *data_pade = NULL;
+    REAL T[2], XI[2], difference = 0.0, reference_norm = 0.0;
+    UINT M, K_exact, K_exp, K_pade, i;
+    INT kappa, ret_code;
+    fnft_nsev_opts_t opts = fnft_nsev_default_opts();
+
+    ret_code = nsev_testcases(nsev_testcases_SECH_FOCUSING, D, &q, T,
+            &M, &exact, &ab, XI, &K_exact, &bound_states_exact,
+            &normconsts, &residues, &kappa);
+    if (ret_code != SUCCESS)
+        goto release_mem;
+    bound_states_exp = malloc(K_exact*sizeof(COMPLEX));
+    bound_states_pade = malloc(K_exact*sizeof(COMPLEX));
+    data_exp = malloc(2*K_exact*sizeof(COMPLEX));
+    data_pade = malloc(2*K_exact*sizeof(COMPLEX));
+    if (bound_states_exp == NULL || bound_states_pade == NULL
+            || data_exp == NULL || data_pade == NULL) {
+        ret_code = E_NOMEM;
+        goto release_mem;
+    }
+    memcpy(bound_states_exp,bound_states_exact,K_exact*sizeof(COMPLEX));
+    memcpy(bound_states_pade,bound_states_exact,K_exact*sizeof(COMPLEX));
+    opts.discretization = nse_discretization_ES8;
+    opts.bound_state_localization = nsev_bsloc_NEWTON;
+    opts.discspec_type = nsev_dstype_BOTH;
+    K_exp = K_exact;
+    opts.pade_degree = 0;
+    ret_code = fnft_nsev(D,q,T,0,NULL,NULL,&K_exp,bound_states_exp,
+            data_exp,kappa,&opts);
+    if (ret_code != SUCCESS)
+        goto release_mem;
+    K_pade = K_exact;
+    opts.pade_degree = 5;
+    ret_code = fnft_nsev(D,q,T,0,NULL,NULL,&K_pade,bound_states_pade,
+            data_pade,kappa,&opts);
+    if (ret_code != SUCCESS)
+        goto release_mem;
+    if (K_exp != K_exact || K_pade != K_exact) {
+        ret_code = E_TEST_FAILED;
+        goto release_mem;
+    }
+    for (i=0; i<K_exact; i++) {
+        const REAL error = CABS(bound_states_pade[i]-bound_states_exp[i]);
+        if (!isfinite(CREAL(bound_states_pade[i]))
+                || !isfinite(CIMAG(bound_states_pade[i]))
+                || !isfinite(CREAL(bound_states_exp[i]))
+                || !isfinite(CIMAG(bound_states_exp[i]))
+                || !isfinite(error) || !(error <= 2e-10)) {
+            ret_code = E_TEST_FAILED;
+            goto release_mem;
+        }
+    }
+    for (i=0; i<2*K_exact; i++) {
+        const REAL point_error = CABS(data_pade[i]-data_exp[i]);
+        const REAL point_norm = CABS(data_exp[i]);
+        if (!isfinite(CREAL(data_pade[i]))
+                || !isfinite(CIMAG(data_pade[i]))
+                || !isfinite(CREAL(data_exp[i]))
+                || !isfinite(CIMAG(data_exp[i]))
+                || !isfinite(point_error) || !isfinite(point_norm)) {
+            ret_code = E_TEST_FAILED;
+            goto release_mem;
+        }
+        difference += point_error;
+        reference_norm += point_norm;
+    }
+    difference /= 1.0+reference_norm;
+    if (!isfinite(difference) || !(difference < 2e-8)) {
+        fprintf(stderr, "Slow ES8 Padé-5 discrete-data mismatch: %.3e\n",
+                difference);
+        ret_code = E_TEST_FAILED;
+    }
+
+release_mem:
+    free(q);
+    free(exact);
+    free(ab);
+    free(bound_states_exact);
+    free(normconsts);
+    free(residues);
+    free(bound_states_exp);
+    free(bound_states_pade);
+    free(data_exp);
+    free(data_pade);
     return ret_code;
 }
 
@@ -921,6 +1240,13 @@ INT main(void)
     ret_code = test_public_es8_rejections();
     if (ret_code != SUCCESS)
         return EXIT_FAILURE;
+    ret_code = test_slow_es8_pointwise(
+            nsev_testcases_SECH_FOCUSING_CONTSPEC);
+    if (ret_code != SUCCESS)
+        return EXIT_FAILURE;
+    ret_code = test_slow_es8_pointwise(nsev_testcases_SECH_DEFOCUSING);
+    if (ret_code != SUCCESS)
+        return EXIT_FAILURE;
     ret_code = test_es8_pointwise_convergence(
             nsev_testcases_SECH_FOCUSING_CONTSPEC);
     if (ret_code != SUCCESS)
@@ -1003,6 +1329,9 @@ INT main(void)
     if (ret_code != SUCCESS)
         return EXIT_FAILURE;
     ret_code = test_es8_degree7_discrete_data();
+    if (ret_code != SUCCESS)
+        return EXIT_FAILURE;
+    ret_code = test_slow_es8_pade5_discrete_data();
     if (ret_code != SUCCESS)
         return EXIT_FAILURE;
     ret_code = test_richardson_residue_buffer_and_options();

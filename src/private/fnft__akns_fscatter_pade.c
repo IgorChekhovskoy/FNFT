@@ -369,15 +369,22 @@ static void polynomial_add_power(COMPLEX result[LOCAL_MAX_DEGREE + 1],
     }
 }
 
-static void pade_coefficients(const UINT degree,
-        REAL f0[PADE_MAX_DEGREE + 1],
-        REAL temp[PADE_MAX_DEGREE],
-        REAL denominator[PADE_MAX_DEGREE + 1])
+INT fnft__akns_pade_coefficients(const UINT degree,
+        REAL * const f0, REAL * const temp, REAL * const denominator)
 {
     REAL p[PADE_MAX_DEGREE + 1] = {0.0};
     REAL square[2*PADE_MAX_DEGREE + 1] = {0.0};
     REAL product[2*PADE_MAX_DEGREE + 1] = {0.0};
     UINT i, j;
+
+    if (degree == 0 || degree > PADE_MAX_DEGREE)
+        return E_INVALID_ARGUMENT(degree);
+    if (f0 == NULL)
+        return E_INVALID_ARGUMENT(f0);
+    if (temp == NULL)
+        return E_INVALID_ARGUMENT(temp);
+    if (denominator == NULL)
+        return E_INVALID_ARGUMENT(denominator);
 
     p[0] = 1.0;
     for (i = 0; i < degree; i++)
@@ -397,6 +404,7 @@ static void pade_coefficients(const UINT degree,
         if (i < degree)
             temp[i] = square[2*i + 1];
     }
+    return SUCCESS;
 }
 
 static void build_pade_transition(
@@ -431,7 +439,7 @@ static void build_pade_transition(
         polynomial_multiply(lambda_power[i - 1], 2*z_degree*(i - 1),
                 lambda2, 2*z_degree, lambda_power[i]);
 
-    pade_coefficients(pade_degree, f0, temp, denominator);
+    (void)fnft__akns_pade_coefficients(pade_degree, f0, temp, denominator);
     polynomial_zero(f0_polynomial);
     polynomial_zero(temp_polynomial);
     polynomial_zero(denominator_polynomial);

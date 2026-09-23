@@ -25,7 +25,10 @@
 #define FNFT_ENABLE_SHORT_NAMES
 
 #include "fnft_nsev.h"
+#include "fnft_config.h"
+#include "fnft__poly_eval_nfft.h"
 #include "fnft__akns_fscatter_pade.h"
+#include "fnft__akns_scatter.h"
 
 #include <limits.h>
 
@@ -46,6 +49,64 @@ static fnft_nsev_opts_t default_opts = {
     .pade_representation = nsev_pade_representation_DIRECT_CAYLEY
 };
 
+static inline INT nsev_is_slow_es(
+        const nse_discretization_t discretization)
+{
+    return discretization == nse_discretization_ES4
+            || discretization == nse_discretization_ES6
+            || discretization == nse_discretization_ES8;
+}
+
+static inline INT nsev_scatter_matrix(const UINT D,
+        COMPLEX const * const q, COMPLEX const * const r,
+        const REAL eps_t, const INT kappa, const UINT K,
+        COMPLEX const * const lambda, COMPLEX * const result,
+        INT * const W, const nse_discretization_t discretization,
+        const UINT pade_degree, const UINT derivative_flag)
+{
+    if (pade_degree > 0)
+        return nse_scatter_matrix_pade(D,q,r,eps_t,kappa,K,lambda,result,W,
+                discretization,pade_degree,derivative_flag);
+    return nse_scatter_matrix(D,q,r,eps_t,kappa,K,lambda,result,W,
+            discretization,derivative_flag);
+}
+
+static inline INT nsev_scatter_matrix_first_column(const UINT D,
+        COMPLEX const * const q, COMPLEX const * const r,
+        const REAL eps_t, const UINT K, COMPLEX const * const lambda,
+        COMPLEX * const H11, COMPLEX * const H21, INT * const W,
+        const nse_discretization_t discretization,
+        const UINT pade_degree)
+{
+    akns_discretization_t akns_discretization;
+    INT ret_code = nse_discretization_to_akns_discretization(discretization,
+            &akns_discretization);
+
+    CHECK_RETCODE(ret_code, leave_fun);
+    ret_code = akns_scatter_matrix_first_column(D,q,r,eps_t,K,lambda,H11,
+            H21,W,akns_discretization,pade_degree);
+    CHECK_RETCODE(ret_code, leave_fun);
+
+leave_fun:
+    return ret_code;
+}
+
+static inline INT nsev_scatter_bound_states(const UINT D,
+        COMPLEX const * const q, COMPLEX const * const r,
+        REAL const * const T, const UINT K,
+        COMPLEX * const bound_states, COMPLEX * const a_vals,
+        COMPLEX * const aprime_vals, COMPLEX * const b,
+        INT * const Ws, const nse_discretization_t discretization,
+        const UINT pade_degree, const UINT skip_b_flag)
+{
+    if (pade_degree > 0)
+        return nse_scatter_bound_states_pade(D,q,r,T,K,bound_states,a_vals,
+                aprime_vals,b,Ws,discretization,pade_degree,skip_b_flag);
+    return nse_scatter_bound_states(D,q,r,T,K,bound_states,a_vals,
+            aprime_vals,b,Ws,discretization,skip_b_flag);
+}
+
+#ifndef HAVE_NFFT3
 static COMPLEX nsev_evaluate_polynomial(COMPLEX const * const p,
         const UINT degree, const COMPLEX z)
 {
@@ -56,6 +117,7 @@ static COMPLEX nsev_evaluate_polynomial(COMPLEX const * const p,
         value = value*z + p[i];
     return value;
 }
+#endif
 
 static COMPLEX nsev_zero_extended_sample(const UINT D, const UINT index,
         COMPLEX const * const values, const INT offset)
@@ -174,6 +236,7 @@ static inline INT nsev_refine_bound_states_newton(const UINT D,
         UINT K,
         COMPLEX * const bound_states,
         nse_discretization_t const discretization,
+        const UINT pade_degree,
         UINT const niter,
         REAL tol,
         REAL const * const bounding_box,
@@ -224,10 +287,14 @@ INT fnft_nsev(
         return E_INVALID_ARGUMENT(D);
     if (q == NULL)
         return E_INVALID_ARGUMENT(q);
-    if (T == NULL || T[0] >= T[1])
+    if (T == NULL || !isfinite(T[0]) || !isfinite(T[1])
+            || !(T[0] < T[1]) || !isfinite(T[1] - T[0]))
         return E_INVALID_ARGUMENT(T);
-    if (contspec != NULL) {
-        if (XI == NULL || XI[0] >= XI[1])
+    if (contspec != NULL && M > 0) {
+        if (M == 1 || M > (size_t)-1/(4*sizeof(COMPLEX)))
+            return E_INVALID_ARGUMENT(M);
+        if (XI == NULL || !isfinite(XI[0]) || !isfinite(XI[1])
+                || !(XI[0] < XI[1]) || !isfinite(XI[1] - XI[0]))
             return E_INVALID_ARGUMENT(XI);
     }
     if (abs(kappa) != 1)
@@ -238,6 +305,8 @@ INT fnft_nsev(
     }
     if (opts == NULL)
         opts = &default_opts;
+    if (nsev_is_slow_es(opts->discretization) && opts->pade_degree > 7)
+        return E_INVALID_ARGUMENT(opts->pade_degree);
 
     if (opts->pade_representation
             != nsev_pade_representation_DIRECT_CAYLEY
@@ -634,7 +703,7 @@ static inline INT fnft_nsev_base(
         return E_INVALID_ARGUMENT(q);
     if (T == NULL || T[0] >= T[1])
         return E_INVALID_ARGUMENT(T);
-    if (contspec != NULL) {
+    if (contspec != NULL && M > 0) {
         if (XI == NULL || XI[0] >= XI[1])
             return E_INVALID_ARGUMENT(XI);
     }
@@ -852,8 +921,7 @@ static inline INT nsev_prepare_discrete_scattering(
 
     if (requested_discretization == nse_discretization_FTES4_4A ||
             requested_discretization == nse_discretization_FTES4_4B ||
-            requested_discretization == nse_discretization_FTES4_suzuki ||
-            requested_discretization == nse_discretization_FES4_PADE) {
+            requested_discretization == nse_discretization_FTES4_suzuki) {
         const REAL eps_t_2 = eps_t*eps_t;
 
         if (D > (UINT)-1/3)
@@ -893,55 +961,16 @@ static inline INT nsev_prepare_discrete_scattering(
         *D_scatter = 3*D;
         *q_scatter = *q_buffer;
         *r_scatter = *r_buffer;
-        *scatter_discretization = requested_discretization
-                == nse_discretization_FES4_PADE
-                ? nse_discretization_ES4 : nse_discretization_TES4;
-    } else if (requested_discretization == nse_discretization_FES6_PADE) {
-        if (D > (UINT)-1/5)
+        *scatter_discretization = nse_discretization_TES4;
+    } else if (nse_discretization_is_pade(requested_discretization)) {
+        const UINT order = nse_discretization_method_order(requested_discretization);
+        const UINT stride = order-1;
+        const INT radius = (INT)(stride/2);
+
+        if (D > (UINT)-1/(stride*sizeof(COMPLEX)))
             return E_INVALID_ARGUMENT(D);
-        *q_buffer = malloc(5*D*sizeof(COMPLEX));
-        *r_buffer = malloc(5*D*sizeof(COMPLEX));
-        if (*q_buffer == NULL || *r_buffer == NULL) {
-            free(*q_buffer);
-            free(*r_buffer);
-            *q_buffer = NULL;
-            *r_buffer = NULL;
-            return E_NOMEM;
-        }
-
-        for (i = 0; i < D; i++) {
-            COMPLEX q_samples[5], r_samples[5];
-            fnft__akns_es6_stencil_t qs, rs;
-            UINT j;
-
-            for (j = 0; j < 5; j++) {
-                const INT offset = (INT)j - 2;
-                q_samples[j] = nsev_zero_extended_sample(D, i, q, offset);
-                r_samples[j] = nsev_zero_extended_sample(D, i, r, offset);
-            }
-            akns_discretization_es6_stencil(q_samples, eps_t, &qs);
-            akns_discretization_es6_stencil(r_samples, eps_t, &rs);
-            (*q_buffer)[5*i] = qs.value;
-            (*q_buffer)[5*i + 1] = qs.first;
-            (*q_buffer)[5*i + 2] = qs.second;
-            (*q_buffer)[5*i + 3] = qs.third;
-            (*q_buffer)[5*i + 4] = qs.fourth;
-            (*r_buffer)[5*i] = rs.value;
-            (*r_buffer)[5*i + 1] = rs.first;
-            (*r_buffer)[5*i + 2] = rs.second;
-            (*r_buffer)[5*i + 3] = rs.third;
-            (*r_buffer)[5*i + 4] = rs.fourth;
-        }
-
-        *D_scatter = 5*D;
-        *q_scatter = *q_buffer;
-        *r_scatter = *r_buffer;
-        *scatter_discretization = nse_discretization_ES6;
-    } else if (requested_discretization == nse_discretization_FES8_PADE) {
-        if (D > (UINT)-1/7)
-            return E_INVALID_ARGUMENT(D);
-        *q_buffer = malloc(7*D*sizeof(COMPLEX));
-        *r_buffer = malloc(7*D*sizeof(COMPLEX));
+        *q_buffer = malloc(stride*D*sizeof(COMPLEX));
+        *r_buffer = malloc(stride*D*sizeof(COMPLEX));
         if (*q_buffer == NULL || *r_buffer == NULL) {
             free(*q_buffer);
             free(*r_buffer);
@@ -952,36 +981,20 @@ static inline INT nsev_prepare_discrete_scattering(
 
         for (i = 0; i < D; i++) {
             COMPLEX q_samples[7], r_samples[7];
-            fnft__akns_es8_stencil_t qs, rs;
-            UINT j;
-
-            for (j = 0; j < 7; j++) {
-                const INT offset = (INT)j - 3;
-                q_samples[j] = nsev_zero_extended_sample(D, i, q, offset);
-                r_samples[j] = nsev_zero_extended_sample(D, i, r, offset);
+            for (UINT j = 0; j < stride; j++) {
+                const INT offset = (INT)j-radius;
+                q_samples[j] = nsev_zero_extended_sample(D,i,q,offset);
+                r_samples[j] = nsev_zero_extended_sample(D,i,r,offset);
             }
-            fnft__akns_es8_stencil(q_samples, eps_t, &qs);
-            fnft__akns_es8_stencil(r_samples, eps_t, &rs);
-            (*q_buffer)[7*i] = qs.value;
-            (*q_buffer)[7*i + 1] = qs.first;
-            (*q_buffer)[7*i + 2] = qs.second;
-            (*q_buffer)[7*i + 3] = qs.third;
-            (*q_buffer)[7*i + 4] = qs.fourth;
-            (*q_buffer)[7*i + 5] = qs.fifth;
-            (*q_buffer)[7*i + 6] = qs.sixth;
-            (*r_buffer)[7*i] = rs.value;
-            (*r_buffer)[7*i + 1] = rs.first;
-            (*r_buffer)[7*i + 2] = rs.second;
-            (*r_buffer)[7*i + 3] = rs.third;
-            (*r_buffer)[7*i + 4] = rs.fourth;
-            (*r_buffer)[7*i + 5] = rs.fifth;
-            (*r_buffer)[7*i + 6] = rs.sixth;
+            fnft__akns_es_stencil(order,q_samples,eps_t,&(*q_buffer)[stride*i]);
+            fnft__akns_es_stencil(order,r_samples,eps_t,&(*r_buffer)[stride*i]);
         }
 
-        *D_scatter = 7*D;
+        *D_scatter = stride*D;
         *q_scatter = *q_buffer;
         *r_scatter = *r_buffer;
-        *scatter_discretization = nse_discretization_ES8;
+        *scatter_discretization = order == 4 ? nse_discretization_ES4
+                : order == 6 ? nse_discretization_ES6 : nse_discretization_ES8;
     } else if (upsampling_factor == 1 && degree1step != 0) {
         *scatter_discretization = nse_discretization_BO;
     } else if (upsampling_factor == 2 && degree1step != 0) {
@@ -1018,6 +1031,8 @@ static inline INT nsev_compute_boundstates(
     COMPLEX *q_scatter_buffer = NULL;
     COMPLEX *r_scatter_buffer = NULL;
     const INT is_pade = nse_discretization_is_pade(opts->discretization);
+    const UINT slow_pade_degree = nsev_is_slow_es(opts->discretization)
+            ? opts->pade_degree : 0;
 
     degree1step = nse_discretization_degree_with_pade(
             opts->discretization, opts->pade_degree);
@@ -1069,7 +1084,8 @@ static inline INT nsev_compute_boundstates(
                 }
                 for (i = 0, j = 0; i < D_given;
                         i++, j+=upsampling_factor)
-                    q_tmp[i] = (opts->discretization == fnft_nse_discretization_ES6
+                    q_tmp[i] = (opts->discretization == fnft_nse_discretization_ES4
+                            || opts->discretization == fnft_nse_discretization_ES6
                             || opts->discretization == fnft_nse_discretization_ES8)
                             ? q[j]/eps_t : q[j];
                 bounding_box[3] = im_bound(D_given, q_tmp, T, eps_t);
@@ -1122,7 +1138,8 @@ static inline INT nsev_compute_boundstates(
 
             ret_code = nsev_refine_bound_states_newton(D_scatter, q_scatter,
                     r_scatter, T, K, buffer,
-                    discretization, opts->niter, opts->tol, bounding_box, opts->normalization_flag);
+                    discretization, slow_pade_degree, opts->niter, opts->tol,
+                    bounding_box, opts->normalization_flag);
             CHECK_RETCODE(ret_code, leave_fun);
             break;
 
@@ -1212,6 +1229,9 @@ static inline INT nsev_compute_contspec(
         fnft_nsev_opts_t const * const opts)
 {
     COMPLEX *H11_vals = NULL, *H21_vals = NULL, *denominator_vals = NULL;
+#ifdef HAVE_NFFT3
+    REAL *pade_angles = NULL;
+#endif
     COMPLEX A, V;
     REAL scale;
     REAL phase_factor_rho, phase_factor_a, phase_factor_b;
@@ -1251,23 +1271,32 @@ static inline INT nsev_compute_contspec(
     // If the discretization is a slow method then there should be no transfer_matrix
     if (deg == 0 && transfer_matrix == NULL && W == 0){
 
-        // Allocate memory for call to nse_scatter_matrix
-        scatter_coeffs = malloc(4 * M * sizeof(COMPLEX));
-        CHECK_NOMEM(scatter_coeffs, ret_code, leave_fun);
         if (opts->normalization_flag) {
-            Ws = malloc(4 * M * sizeof(INT));
+            Ws = malloc(M * sizeof(INT));
             CHECK_NOMEM(Ws, ret_code, leave_fun);
         }
-        ret_code = nse_scatter_matrix(D, q, r, eps_t, kappa, M,
-                xi, scatter_coeffs, Ws, opts->discretization, 0);
-        CHECK_RETCODE(ret_code, leave_fun);
+        if (nsev_is_slow_es(opts->discretization)) {
+            ret_code = nsev_scatter_matrix_first_column(D,q,r,eps_t,M,xi,
+                    H11_vals,H21_vals,Ws,opts->discretization,
+                    opts->pade_degree);
+            CHECK_RETCODE(ret_code, leave_fun);
+        } else {
+            // Allocate memory for call to nse_scatter_matrix
+            scatter_coeffs = malloc(4 * M * sizeof(COMPLEX));
+            CHECK_NOMEM(scatter_coeffs, ret_code, leave_fun);
+            ret_code = nsev_scatter_matrix(D,q,r,eps_t,kappa,M,xi,
+                    scatter_coeffs,Ws,opts->discretization,0,0);
+            CHECK_RETCODE(ret_code, leave_fun);
+            for (i=0; i<M; i++) {
+                H11_vals[i] = scatter_coeffs[i*4];
+                H21_vals[i] = scatter_coeffs[i*4+2];
+            }
+        }
 
         // This is necessary because nse_scatter_matrix to ensure
         // boundary conditions can be applied using common code for slow
         // methods and polynomial transfer matrix based methods.
         for (i = 0; i < M; i++){
-            H11_vals[i] = scatter_coeffs[i*4];
-            H21_vals[i] = scatter_coeffs[i*4+2];
             if (opts->normalization_flag) {
                 const REAL scl = POW(2, Ws[i]);
                 H11_vals[i] *= scl;
@@ -1291,6 +1320,79 @@ static inline INT nsev_compute_contspec(
             ret_code = E_NOMEM;
             goto leave_fun;
         }
+#ifdef HAVE_NFFT3
+        pade_angles = malloc(M*sizeof(REAL));
+        if (pade_angles == NULL) {
+            ret_code = E_NOMEM;
+            goto leave_fun;
+        }
+        if (!use_chebyshev) {
+            for (i = 0; i < M; i++) {
+                ret_code = nse_discretization_pade_lambda_to_z(1, eps_t,
+                        &xi[i], h);
+                CHECK_RETCODE(ret_code, leave_fun);
+                pade_angles[i] = CARG(xi[i]);
+            }
+        } else {
+            if (!(H > 0.0) || !isfinite(H) || !isfinite(c)) {
+                ret_code = E_INVALID_ARGUMENT(XI);
+                goto leave_fun;
+            }
+            for (i = 0; i < M; i++) {
+                REAL x = (eps_t*CREAL(xi[i]) - c)/H;
+
+                /* Both endpoints are part of the grid. Use their exact
+                 * mapped values rather than rounding them outside [-1,1]. */
+                if (i == 0)
+                    x = -1.0;
+                else if (i == M - 1)
+                    x = 1.0;
+                if (!isfinite(x) || x < -1.0 || x > 1.0) {
+                    ret_code = E_INVALID_ARGUMENT(XI);
+                    goto leave_fun;
+                }
+                pade_angles[i] = acos(x);
+            }
+        }
+        if (denominator_degree == deg) {
+            COMPLEX const *polynomials[3] = {
+                transfer_matrix,
+                transfer_matrix + 2*(deg + 1),
+                denominator
+            };
+            COMPLEX *values[3] = {H11_vals, H21_vals, denominator_vals};
+
+            if (use_chebyshev)
+                ret_code = poly_eval_nfft_chebyshev(deg, 3,
+                        polynomials, M, pade_angles, values);
+            else
+                ret_code = poly_eval_nfft_power(deg, 3,
+                        polynomials, M, pade_angles, values);
+            CHECK_RETCODE(ret_code, leave_fun);
+        } else {
+            COMPLEX const *numerators[2] = {
+                transfer_matrix, transfer_matrix + 2*(deg + 1)
+            };
+            COMPLEX *numerator_values[2] = {H11_vals, H21_vals};
+            COMPLEX const *denominators[1] = {denominator};
+            COMPLEX *denominator_values[1] = {denominator_vals};
+
+            if (use_chebyshev) {
+                ret_code = poly_eval_nfft_chebyshev(deg, 2,
+                        numerators, M, pade_angles, numerator_values);
+                CHECK_RETCODE(ret_code, leave_fun);
+                ret_code = poly_eval_nfft_chebyshev(denominator_degree, 1,
+                        denominators, M, pade_angles, denominator_values);
+            } else {
+                ret_code = poly_eval_nfft_power(deg, 2,
+                        numerators, M, pade_angles, numerator_values);
+                CHECK_RETCODE(ret_code, leave_fun);
+                ret_code = poly_eval_nfft_power(denominator_degree, 1,
+                        denominators, M, pade_angles, denominator_values);
+            }
+            CHECK_RETCODE(ret_code, leave_fun);
+        }
+#else
         if (!use_chebyshev) {
             for (i = 0; i < M; i++) {
                 ret_code = nse_discretization_pade_lambda_to_z(1, eps_t,
@@ -1318,12 +1420,27 @@ static inline INT nsev_compute_contspec(
                 denominator_vals[i] = nsev_evaluate_polynomial(denominator,
                         denominator_degree, xi[i]);
             }
+        }
+#endif
+        for (i = 0; i < M; i++) {
+            if (!isfinite(CREAL(H11_vals[i])) || !isfinite(CIMAG(H11_vals[i]))
+                    || !isfinite(CREAL(H21_vals[i])) || !isfinite(CIMAG(H21_vals[i]))
+                    || !isfinite(CREAL(denominator_vals[i]))
+                    || !isfinite(CIMAG(denominator_vals[i]))) {
+                ret_code = E_OTHER("Non-finite Padé polynomial value.");
+                goto leave_fun;
+            }
             if (denominator_vals[i] == 0.0) {
                 ret_code = E_DIV_BY_ZERO;
                 goto leave_fun;
             }
             H11_vals[i] /= denominator_vals[i];
             H21_vals[i] /= denominator_vals[i];
+            if (!isfinite(CREAL(H11_vals[i])) || !isfinite(CIMAG(H11_vals[i]))
+                    || !isfinite(CREAL(H21_vals[i])) || !isfinite(CIMAG(H21_vals[i]))) {
+                ret_code = E_OTHER("Non-finite Padé scattering value.");
+                goto leave_fun;
+            }
         }
         for (i = 0; i < M; i++)
             xi[i] = XI[0] + eps_xi*i;
@@ -1397,9 +1514,23 @@ static inline INT nsev_compute_contspec(
             goto leave_fun;
     }
 
+    if (nse_discretization_is_pade(opts->discretization)) {
+        const UINT count = opts->contspec_type == nsev_cstype_BOTH ? 3*M
+                : (opts->contspec_type == nsev_cstype_AB ? 2*M : M);
+        for (i = 0; i < count; i++) {
+            if (!isfinite(CREAL(result[i])) || !isfinite(CIMAG(result[i]))) {
+                ret_code = E_OTHER("Non-finite Padé continuous spectrum.");
+                goto leave_fun;
+            }
+        }
+    }
+
     leave_fun:
         free(H11_vals);
         free(denominator_vals);
+#ifdef HAVE_NFFT3
+        free(pade_angles);
+#endif
         free(scatter_coeffs);
         free(Ws);
         free(xi);
@@ -1428,6 +1559,8 @@ static inline INT nsev_compute_normconsts_or_residues(
     COMPLEX const *r_scatter = r;
     COMPLEX *q_scatter_buffer = NULL;
     COMPLEX *r_scatter_buffer = NULL;
+    const UINT slow_pade_degree = nsev_is_slow_es(opts->discretization)
+            ? opts->pade_degree : 0;
     // Check inputs
     if (K == 0) // no bound states
         return SUCCESS;
@@ -1460,9 +1593,9 @@ static inline INT nsev_compute_normconsts_or_residues(
             &discretization, &q_scatter_buffer, &r_scatter_buffer);
     CHECK_RETCODE(ret_code, leave_fun);
 
-    ret_code = nse_scatter_bound_states(D_scatter, q_scatter, r_scatter, T, K,
+    ret_code = nsev_scatter_bound_states(D_scatter, q_scatter, r_scatter, T, K,
             bound_states, a_vals, aprime_vals, normconsts_or_residues, 
-            Ws, discretization, 0/*skip_b_flag*/);
+            Ws, discretization, slow_pade_degree, 0/*skip_b_flag*/);
     CHECK_RETCODE(ret_code, leave_fun);
 
     // Update to or add residues if requested
@@ -1510,6 +1643,7 @@ static inline INT nsev_refine_bound_states_newton(
         const UINT K,
         COMPLEX * const bound_states,
         nse_discretization_t const discretization,
+        const UINT pade_degree,
         const UINT niter,
         REAL tol,
         REAL const * const bounding_box,
@@ -1548,9 +1682,9 @@ static inline INT nsev_refine_bound_states_newton(
         for (iter=0; iter<niter; iter++) {
 
             // Compute a(lam) and a'(lam) at the current root
-            ret_code = nse_scatter_bound_states(D, q, r, T, 1,
+            ret_code = nsev_scatter_bound_states(D, q, r, T, 1,
                     bound_states + i, &a_val, &aprime_val, NULL,
-                    W_ptr, discretization, 1/*skip_b_flag*/);
+                    W_ptr, discretization, pade_degree, 1/*skip_b_flag*/);
             if (ret_code != SUCCESS){
                 ret_code = E_SUBROUTINE(ret_code);
                 CHECK_RETCODE(ret_code, leave_fun);

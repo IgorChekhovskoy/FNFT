@@ -29,6 +29,17 @@
 #include "fnft__poly_fmult.h"
 
 /**
+ * @brief Coefficients of the scalar polynomials in a diagonal Padé step.
+ *
+ * For a traceless matrix Z with delta*I=Z^2, the [s/s] approximation is
+ * (F(delta)*I+G(delta)*Z)/D(delta). The output arrays must have lengths
+ * s+1, s and s+1, respectively.
+ */
+FNFT_INT fnft__akns_pade_coefficients(FNFT_UINT degree,
+        FNFT_REAL * const F, FNFT_REAL * const G,
+        FNFT_REAL * const denominator);
+
+/**
  * @brief Number of elements required for the numerator matrix buffer.
  *
  * @param[in] D Number of samples.
@@ -110,6 +121,7 @@ FNFT_INT fnft__akns_fscatter_pade_chebyshev(const FNFT_UINT D,
         FNFT_INT * const denominator_exponent);
 
 #ifdef FNFT_ENABLE_SHORT_NAMES
+#define akns_pade_coefficients(...) fnft__akns_pade_coefficients(__VA_ARGS__)
 #define akns_fscatter_pade_numel(...) fnft__akns_fscatter_pade_numel(__VA_ARGS__)
 #define akns_fscatter_pade_den_numel(...) fnft__akns_fscatter_pade_den_numel(__VA_ARGS__)
 #define akns_fscatter_pade(...) fnft__akns_fscatter_pade(__VA_ARGS__)

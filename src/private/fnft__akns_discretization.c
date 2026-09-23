@@ -677,7 +677,6 @@ INT fnft__akns_discretization_preprocess_signal(UINT const D,
                                          + qr_weights[11]*r_from_q[0](q_3[i]);
             }
             break;
-        case akns_discretization_ES4:
         case akns_discretization_TES4:
             for (isub=0, i=0; isub<D_effective; isub+=3, i+=nskip_per_step) {
                 q_preprocessed[isub] = q[i];
@@ -714,60 +713,35 @@ INT fnft__akns_discretization_preprocess_signal(UINT const D,
                 r_preprocessed[isub+2] = r_from_q[0](q_minus);
             }
             break;
+        case akns_discretization_ES4:
         case akns_discretization_ES6:
-            for (isub=0, i=0; isub<D_effective; isub+=5, i+=nskip_per_step) {
-                COMPLEX q_samples[5], r_samples[5];
-                fnft__akns_es6_stencil_t qs, rs;
-                const REAL eps_t_sub = eps_t*nskip_per_step;
-                for (UINT j=0; j<5; j++) {
-                    const INT offset = (INT)j-2;
-                    const INT index = (INT)i+offset*(INT)nskip_per_step;
-                    q_samples[j] = index >= 0 && index < (INT)D ? q[index] : 0.0;
-                    r_samples[j] = r_from_q[0](q_samples[j]);
-                }
-                akns_discretization_es6_stencil(q_samples, eps_t_sub, &qs);
-                akns_discretization_es6_stencil(r_samples, eps_t_sub, &rs);
-                q_preprocessed[isub] = qs.value;
-                q_preprocessed[isub+1] = qs.first;
-                q_preprocessed[isub+2] = qs.second;
-                q_preprocessed[isub+3] = qs.third;
-                q_preprocessed[isub+4] = qs.fourth;
-                r_preprocessed[isub] = rs.value;
-                r_preprocessed[isub+1] = rs.first;
-                r_preprocessed[isub+2] = rs.second;
-                r_preprocessed[isub+3] = rs.third;
-                r_preprocessed[isub+4] = rs.fourth;
-            }
-            break;
         case akns_discretization_ES8:
-            for (isub=0, i=0; isub<D_effective; isub+=7, i+=nskip_per_step) {
+        {
+            const UINT order = upsampling_factor+1;
+            const UINT radius = upsampling_factor/2;
+            const REAL eps_t_sub = eps_t*nskip_per_step;
+            for (isub=0, i=0; isub<D_effective;
+                    isub+=upsampling_factor, i+=nskip_per_step) {
                 COMPLEX q_samples[7], r_samples[7];
-                fnft__akns_es8_stencil_t qs, rs;
-                const REAL eps_t_sub = eps_t*nskip_per_step;
-                for (UINT j=0; j<7; j++) {
-                    const INT offset = (INT)j-3;
-                    const INT index = (INT)i+offset*(INT)nskip_per_step;
-                    q_samples[j] = index >= 0 && index < (INT)D ? q[index] : 0.0;
-                    r_samples[j] = r_from_q[0](q_samples[j]);
+                for (UINT j=0; j<upsampling_factor; j++) {
+                    const UINT distance = j < radius ? radius-j : j-radius;
+                    COMPLEX value = 0.0;
+                    if (j < radius) {
+                        if (distance <= i/nskip_per_step)
+                            value = q[i-distance*nskip_per_step];
+                    } else if (distance <= (D-1-i)/nskip_per_step) {
+                        value = q[i+distance*nskip_per_step];
+                    }
+                    q_samples[j] = value;
+                    r_samples[j] = r_from_q[0](value);
                 }
-                fnft__akns_es8_stencil(q_samples,eps_t_sub,&qs);
-                fnft__akns_es8_stencil(r_samples,eps_t_sub,&rs);
-                q_preprocessed[isub] = qs.value;
-                q_preprocessed[isub+1] = qs.first;
-                q_preprocessed[isub+2] = qs.second;
-                q_preprocessed[isub+3] = qs.third;
-                q_preprocessed[isub+4] = qs.fourth;
-                q_preprocessed[isub+5] = qs.fifth;
-                q_preprocessed[isub+6] = qs.sixth;
-                r_preprocessed[isub] = rs.value;
-                r_preprocessed[isub+1] = rs.first;
-                r_preprocessed[isub+2] = rs.second;
-                r_preprocessed[isub+3] = rs.third;
-                r_preprocessed[isub+4] = rs.fourth;
-                r_preprocessed[isub+5] = rs.fifth;
-                r_preprocessed[isub+6] = rs.sixth;
+                fnft__akns_es_stencil(order,q_samples,eps_t_sub,
+                        &q_preprocessed[isub]);
+                fnft__akns_es_stencil(order,r_samples,eps_t_sub,
+                        &r_preprocessed[isub]);
             }
             break;
+        }
         default: // Unknown discretization
 
             ret_code = E_INVALID_ARGUMENT(discretization);

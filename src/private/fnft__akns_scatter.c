@@ -24,6 +24,7 @@
 #define FNFT_ENABLE_SHORT_NAMES
 
 #include "fnft__akns_scatter.h"
+#include "fnft__akns_fscatter_pade.h"
 
 /**
  * Auxiliary routines, used by the main routines below
@@ -263,164 +264,188 @@ leave_fun:
 }
 
 /**
- * Sixth-order exponential transition matrix exp(Z), with Z given by
- * Eqs. 65--67 of https://doi.org/10.1016/j.jcp.2021.110764. The five
- * entries of q and r are the scaled value and first through fourth
- * differences produced during preprocessing.
+ * Exponential transition matrix exp(Z) for ES4, ES6 and ES8. The
+ * order-dependent coefficients of Z(eps_t*lambda) are precomputed once
+ * per time node. This routine also evaluates the lambda derivative and
+ * the inverse transition matrix from the same polynomial.
  */
-static inline void akns_scatter_U_ES6(COMPLEX const q[5],
-                                     COMPLEX const r[5],
-                                     COMPLEX const lambda,
-                                     REAL const eps_t,
-                                     UINT const derivative_flag,
-                                     UINT const inverse_flag,
-                                     COMPLEX * const U)
+typedef struct {
+    UINT degree;
+    REAL const *F;
+    REAL const *G;
+    REAL const *denominator;
+} akns_scatter_pade_coefficients_t;
+
+/* The common slow-ES state already lies in the no-op interval of
+ * misc_normalize_vector. Avoid cabs, log2 and pow in that case. */
+static inline INT akns_scatter_normalize_ES_vector(UINT const len,
+                                                    COMPLEX * const v)
 {
-    const COMPLEX z = eps_t*lambda;
-    const COMPLEX z2 = z*z;
-    const COMPLEX z3 = z2*z;
-    COMPLEX Z[4], Zd[4] = {0};
-    COMPLEX delta, delta_d = 0.0, c, s, s_delta;
-    COMPLEX c_d = 0.0, s_d = 0.0;
-    const REAL sign = inverse_flag ? -1.0 : 1.0;
+    REAL max_abs_squared = 0.0;
 
-    Z[0] = (r[0]*q[1]-q[0]*r[1])*z2/180.0
-            - I*(1.0-(r[0]*q[2]+q[0]*r[2])/360.0
-            +q[1]*r[1]/60.0)*z
-            +(15.0-q[0]*r[0])*(r[0]*q[1]-q[0]*r[1])/180.0
-            +(r[0]*q[3]-q[0]*r[3]+q[1]*r[2]-r[1]*q[2])/480.0;
-    Z[1] = I*q[1]*z3/90.0-q[2]*z2/180.0
-            +I*(q[1]/6.0+q[3]/240.0-q[0]*r[0]*q[1]/90.0)*z
-            +q[0]+q[0]*(r[0]*q[2]-q[0]*r[2])/360.0
-            +(q[0]*r[1]-r[0]*q[1])*q[1]/120.0
-            +q[2]/24.0+q[4]/1920.0;
-    Z[2] = -I*r[1]*z3/90.0-r[2]*z2/180.0
-            -I*(r[1]/6.0+r[3]/240.0-q[0]*r[0]*r[1]/90.0)*z
-            +r[0]+r[0]*(q[0]*r[2]-r[0]*q[2])/360.0
-            +(r[0]*q[1]-q[0]*r[1])*r[1]/120.0
-            +r[2]/24.0+r[4]/1920.0;
-    Z[3] = -Z[0];
+    for (UINT i=0; i<len; i++) {
+        const REAL real_part = CREAL(v[i]);
+        const REAL imag_part = CIMAG(v[i]);
+        const REAL abs_squared = real_part*real_part+imag_part*imag_part;
 
-    if (derivative_flag) {
-        Zd[0] = eps_t*(2.0*(r[0]*q[1]-q[0]*r[1])*z/180.0
-                -I*(1.0-(r[0]*q[2]+q[0]*r[2])/360.0
-                +q[1]*r[1]/60.0));
-        Zd[1] = eps_t*(I*q[1]*z2/30.0-q[2]*z/90.0
-                +I*(q[1]/6.0+q[3]/240.0
-                -q[0]*r[0]*q[1]/90.0));
-        Zd[2] = eps_t*(-I*r[1]*z2/30.0-r[2]*z/90.0
-                -I*(r[1]/6.0+r[3]/240.0
-                -q[0]*r[0]*r[1]/90.0));
-        Zd[3] = -Zd[0];
+        if (!isfinite(abs_squared))
+            return misc_normalize_vector(len,v);
+        if (abs_squared > max_abs_squared)
+            max_abs_squared = abs_squared;
     }
-
-    delta = Z[0]*Z[0]+Z[1]*Z[2];
-    if (CABS(delta) < 1e-8) {
-        const COMPLEX delta2 = delta*delta;
-        const COMPLEX delta3 = delta2*delta;
-        const COMPLEX delta4 = delta3*delta;
-        c = 1.0+delta/2.0+delta2/24.0+delta3/720.0
-                +delta4/40320.0;
-        s = 1.0+delta/6.0+delta2/120.0+delta3/5040.0
-                +delta4/362880.0;
-        s_delta = 1.0/6.0+delta/60.0+delta2/1680.0
-                +delta3/90720.0;
-    } else {
-        const COMPLEX root = CSQRT(delta);
-        c = CCOSH(root);
-        s = misc_CSINC(I*root);
-        s_delta = (c-s)/(2.0*delta);
-    }
-    if (derivative_flag) {
-        delta_d = 2.0*Z[0]*Zd[0]+Zd[1]*Z[2]+Z[1]*Zd[2];
-        c_d = 0.5*s*delta_d;
-        s_d = s_delta*delta_d;
-    }
-
-    if (derivative_flag) {
-        memset(U,0,16*sizeof(COMPLEX));
-        U[0] = U[10] = c+sign*s*Z[0];
-        U[1] = U[11] = sign*s*Z[1];
-        U[4] = U[14] = sign*s*Z[2];
-        U[5] = U[15] = c+sign*s*Z[3];
-        U[8] = c_d+sign*(s_d*Z[0]+s*Zd[0]);
-        U[9] = sign*(s_d*Z[1]+s*Zd[1]);
-        U[12] = sign*(s_d*Z[2]+s*Zd[2]);
-        U[13] = c_d+sign*(s_d*Z[3]+s*Zd[3]);
-    } else {
-        U[0] = c+sign*s*Z[0];
-        U[1] = sign*s*Z[1];
-        U[2] = sign*s*Z[2];
-        U[3] = c+sign*s*Z[3];
-    }
+    if (max_abs_squared > 1.0+8.0*EPSILON
+            && max_abs_squared < 4.0-32.0*EPSILON)
+        return 0;
+    return misc_normalize_vector(len,v);
 }
 
-/**
- * Eighth-order exponential transition matrix exp(Z), with the degree-five
- * matrix polynomial Z from Eqs. 51--60 of arXiv:2608.11892v1. The coefficients
- * are precomputed once per time node before iterating over lambda.
- */
-static inline void akns_scatter_U_ES8(COMPLEX const coeff[24],
+static inline void akns_scatter_apply_U_ES(
+        COMPLEX const * const U, UINT const U_stride,
+        COMPLEX const * const v, UINT const v_stride,
+        COMPLEX * const result, UINT const result_stride)
+{
+    result[0] = U[0]*v[0]+U[1]*v[v_stride];
+    result[result_stride] = U[U_stride]*v[0]
+            +U[U_stride+1]*v[v_stride];
+}
+
+static inline void akns_scatter_apply_U_ES_derivative(
+        COMPLEX const U[16], COMPLEX const v[4], COMPLEX result[4])
+{
+    COMPLEX derivative_part[2];
+
+    akns_scatter_apply_U_ES(U,4,v,1,result,1);
+    akns_scatter_apply_U_ES(&U[8],4,v,1,derivative_part,1);
+    akns_scatter_apply_U_ES(&U[10],4,&v[2],1,&result[2],1);
+    result[2] += derivative_part[0];
+    result[3] += derivative_part[1];
+}
+
+static inline INT akns_scatter_U_ES(COMPLEX const * const coeff,
+                                     UINT const degree,
                                      COMPLEX const lambda,
                                      REAL const eps_t,
+                                     akns_scatter_pade_coefficients_t const *
+                                        const pade,
                                      UINT const derivative_flag,
                                      UINT const inverse_flag,
                                      COMPLEX * const U)
 {
     const COMPLEX z = eps_t*lambda;
     COMPLEX Z[4], Zd[4] = {0};
-    COMPLEX delta, delta_d = 0.0, c, s, s_delta;
-    COMPLEX c_d = 0.0, s_d = 0.0;
+    COMPLEX delta, delta_d = 0.0, f, g;
+    COMPLEX f_d = 0.0, g_d = 0.0;
     const REAL sign = inverse_flag ? -1.0 : 1.0;
+    INT ret_code = SUCCESS;
 
-    for (UINT j=0; j<4; j++) {
-        Z[j] = coeff[20+j];
-        for (UINT k=5; k-->0; )
+    /* Every coefficient produced by fnft__akns_es_z_coefficients is
+     * traceless. Evaluate the three independent entries and reconstruct
+     * the fourth one. */
+    for (UINT j=0; j<3; j++) {
+        Z[j] = coeff[4*degree+j];
+        for (UINT k=degree; k-->0; )
             Z[j] = Z[j]*z+coeff[4*k+j];
         if (derivative_flag) {
-            Zd[j] = 5.0*coeff[20+j];
-            for (UINT k=5; k-->1; )
+            Zd[j] = degree*coeff[4*degree+j];
+            for (UINT k=degree; k-->1; )
                 Zd[j] = Zd[j]*z+k*coeff[4*k+j];
             Zd[j] *= eps_t;
         }
     }
+    Z[3] = -Z[0];
+    if (derivative_flag)
+        Zd[3] = -Zd[0];
 
     delta = Z[0]*Z[0]+Z[1]*Z[2];
-    if (CABS(delta) < 1e-8) {
-        const COMPLEX delta2 = delta*delta;
-        const COMPLEX delta3 = delta2*delta;
-        const COMPLEX delta4 = delta3*delta;
-        c = 1.0+delta/2.0+delta2/24.0+delta3/720.0
-                +delta4/40320.0;
-        s = 1.0+delta/6.0+delta2/120.0+delta3/5040.0
-                +delta4/362880.0;
-        s_delta = 1.0/6.0+delta/60.0+delta2/1680.0
-                +delta3/90720.0;
-    } else {
-        const COMPLEX root = CSQRT(delta);
-        c = CCOSH(root);
-        s = misc_CSINC(I*root);
-        s_delta = (c-s)/(2.0*delta);
-    }
     if (derivative_flag) {
         delta_d = 2.0*Z[0]*Zd[0]+Zd[1]*Z[2]+Z[1]*Zd[2];
-        c_d = 0.5*s*delta_d;
-        s_d = s_delta*delta_d;
-        memset(U,0,16*sizeof(COMPLEX));
-        U[0] = U[10] = c+sign*s*Z[0];
-        U[1] = U[11] = sign*s*Z[1];
-        U[4] = U[14] = sign*s*Z[2];
-        U[5] = U[15] = c+sign*s*Z[3];
-        U[8] = c_d+sign*(s_d*Z[0]+s*Zd[0]);
-        U[9] = sign*(s_d*Z[1]+s*Zd[1]);
-        U[12] = sign*(s_d*Z[2]+s*Zd[2]);
-        U[13] = c_d+sign*(s_d*Z[3]+s*Zd[3]);
-    } else {
-        U[0] = c+sign*s*Z[0];
-        U[1] = sign*s*Z[1];
-        U[2] = sign*s*Z[2];
-        U[3] = c+sign*s*Z[3];
     }
+    if (pade == NULL) {
+        COMPLEX f_delta;
+
+        if (CABS(delta) < 1e-8) {
+            const COMPLEX delta2 = delta*delta;
+            const COMPLEX delta3 = delta2*delta;
+            const COMPLEX delta4 = delta3*delta;
+            f = 1.0+delta/2.0+delta2/24.0+delta3/720.0
+                    +delta4/40320.0;
+            g = 1.0+delta/6.0+delta2/120.0+delta3/5040.0
+                    +delta4/362880.0;
+            f_delta = 1.0/6.0+delta/60.0+delta2/1680.0
+                    +delta3/90720.0;
+        } else {
+            const COMPLEX root = CSQRT(delta);
+            fnft__akns_scatter_exact_scalar_pair(root,&f,&g);
+            f_delta = (f-g)/(2.0*delta);
+        }
+        if (derivative_flag) {
+            f_d = 0.5*g*delta_d;
+            g_d = f_delta*delta_d;
+        }
+    } else {
+        const UINT pade_degree = pade->degree;
+        REAL const * const F_coeff = pade->F;
+        REAL const * const G_coeff = pade->G;
+        REAL const * const denominator_coeff = pade->denominator;
+        COMPLEX F, G, denominator, denominator_inverse;
+        COMPLEX F_delta = 0.0, G_delta = 0.0;
+        COMPLEX denominator_delta = 0.0;
+        F = F_coeff[pade_degree];
+        denominator = denominator_coeff[pade_degree];
+        for (UINT k=pade_degree; k-->0; ) {
+            F = F*delta+F_coeff[k];
+            denominator = denominator*delta+denominator_coeff[k];
+        }
+        G = G_coeff[pade_degree-1];
+        for (UINT k=pade_degree-1; k-->0; )
+            G = G*delta+G_coeff[k];
+        if (denominator == 0.0) {
+            ret_code = E_DIV_BY_ZERO;
+            goto leave_fun;
+        }
+        denominator_inverse = 1.0/denominator;
+        if (derivative_flag) {
+            F_delta = pade_degree*F_coeff[pade_degree];
+            denominator_delta = pade_degree
+                    *denominator_coeff[pade_degree];
+            for (UINT k=pade_degree; k-->1; ) {
+                F_delta = F_delta*delta+k*F_coeff[k];
+                denominator_delta = denominator_delta*delta
+                        +k*denominator_coeff[k];
+            }
+            if (pade_degree > 1) {
+                G_delta = (pade_degree-1)*G_coeff[pade_degree-1];
+                for (UINT k=pade_degree-1; k-->1; )
+                    G_delta = G_delta*delta+k*G_coeff[k];
+            }
+            f_d = (F_delta*denominator-F*denominator_delta)*delta_d
+                    *denominator_inverse*denominator_inverse;
+            g_d = (G_delta*denominator-G*denominator_delta)*delta_d
+                    *denominator_inverse*denominator_inverse;
+        }
+        f = F*denominator_inverse;
+        g = G*denominator_inverse;
+    }
+    if (derivative_flag) {
+        memset(U,0,16*sizeof(COMPLEX));
+        U[0] = U[10] = f+sign*g*Z[0];
+        U[1] = U[11] = sign*g*Z[1];
+        U[4] = U[14] = sign*g*Z[2];
+        U[5] = U[15] = f+sign*g*Z[3];
+        U[8] = f_d+sign*(g_d*Z[0]+g*Zd[0]);
+        U[9] = sign*(g_d*Z[1]+g*Zd[1]);
+        U[12] = sign*(g_d*Z[2]+g*Zd[2]);
+        U[13] = f_d+sign*(g_d*Z[3]+g*Zd[3]);
+    } else {
+        U[0] = f+sign*g*Z[0];
+        U[1] = sign*g*Z[1];
+        U[2] = sign*g*Z[2];
+        U[3] = f+sign*g*Z[3];
+    }
+    return SUCCESS;
+
+leave_fun:
+    return ret_code;
 }
 
 /**
@@ -431,18 +456,21 @@ static inline void akns_scatter_U_ES8(COMPLEX const coeff[24],
  * result where S11' is the derivative of S11 w.r.t to lambda.
  * Result should be preallocated with size 4*K or 8*K accordingly.
  */
-INT akns_scatter_matrix(UINT const D,
+static INT akns_scatter_matrix_impl(UINT const D,
                         COMPLEX const * const q,
                         COMPLEX const * const r,
                         REAL const eps_t,
                         UINT const K,
                         COMPLEX const * const lambda,
                         COMPLEX * const result,
+                        COMPLEX * const result_second,
                         INT * const W,
-                        akns_discretization_t const discretization,
-                        akns_pde_t const PDE,
-                        UINT const vanilla_flag,
-                        UINT const derivative_flag)
+                         akns_discretization_t const discretization,
+                         akns_pde_t const PDE,
+                         UINT const vanilla_flag,
+                         UINT const pade_degree,
+                         UINT const derivative_flag,
+                         UINT const first_column_flag)
 {
     INT ret_code = SUCCESS;
 
@@ -461,13 +489,49 @@ INT akns_scatter_matrix(UINT const D,
         return E_INVALID_ARGUMENT(lambda);
     if (result == NULL)
         return E_INVALID_ARGUMENT(result);
+    if (first_column_flag && result_second == NULL)
+        return E_INVALID_ARGUMENT(result_second);
     if (derivative_flag != 0 && derivative_flag != 1)
         return E_INVALID_ARGUMENT(derivative_flag);
+    if (first_column_flag && (derivative_flag
+            || PDE != akns_pde_NSE || vanilla_flag
+            || (discretization != akns_discretization_ES4
+                && discretization != akns_discretization_ES6
+                && discretization != akns_discretization_ES8)))
+        return E_INVALID_ARGUMENT(first_column_flag);
+    if (first_column_flag) {
+        for (UINT i=0; i<K; i++) {
+            if (CIMAG(lambda[i]) != 0.0)
+                return E_INVALID_ARGUMENT(lambda);
+        }
+    }
+    if (pade_degree > 7 || (pade_degree != 0
+            && discretization != akns_discretization_ES4
+            && discretization != akns_discretization_ES6
+            && discretization != akns_discretization_ES8))
+        return E_INVALID_ARGUMENT(pade_degree);
     UINT const upsampling_factor = akns_discretization_upsampling_factor(discretization);
     if (upsampling_factor == 0)
         return E_INVALID_ARGUMENT(discretization);
     if (D%upsampling_factor != 0)
         return E_ASSERTION_FAILED;
+    const UINT es_degree = upsampling_factor >= 3 ? upsampling_factor-2 : 0;
+    const UINT es_numel = 4*(es_degree+1);
+    REAL pade_F[8], pade_G[7], pade_denominator[8];
+    akns_scatter_pade_coefficients_t pade_coefficients;
+    akns_scatter_pade_coefficients_t const *pade = NULL;
+
+    if (pade_degree != 0) {
+        ret_code = akns_pade_coefficients(pade_degree,pade_F,pade_G,
+                pade_denominator);
+        if (ret_code != SUCCESS)
+            return ret_code;
+        pade_coefficients.degree = pade_degree;
+        pade_coefficients.F = pade_F;
+        pade_coefficients.G = pade_G;
+        pade_coefficients.denominator = pade_denominator;
+        pade = &pade_coefficients;
+    }
 
     // Declare pointers that may or may not be used, depending on the discretization.
     // We must do so before possibly jumping to leave_fun.
@@ -479,39 +543,24 @@ INT akns_scatter_matrix(UINT const D,
 
     // Pre-computing weights required for higher-order CF methods that are
     // independent of q, r and l.
-    // In the case of ES4 and TES4 computing values that are functions of
-    // q and r but not l.
+    // For ES4/ES6/ES8, precompute the coefficients of Z(eps_t*l);
+    // for TES4, precompute the outer matrix exponentials.
 
-    UINT N = 0;
     switch (discretization) {
         case akns_discretization_CT4:
-        case akns_discretization_ES6:
-            break;
-        case akns_discretization_ES8:
-            tmp1 = malloc(24*(D/7)*sizeof(COMPLEX));
-            CHECK_NOMEM(tmp1,ret_code,leave_fun);
-            for (UINT n=0, node=0; n<D; n+=7, node++)
-                fnft__akns_es8_z_coefficients(&q[n],&r[n],&tmp1[24*node]);
             break;
         case akns_discretization_ES4:
-            tmp1 = derivative_flag ? malloc(2*D*sizeof(COMPLEX)) : malloc(D*sizeof(COMPLEX));
-            if (tmp1 == NULL) {
-                ret_code = E_NOMEM;
-                CHECK_RETCODE(ret_code, leave_fun);
+        case akns_discretization_ES6:
+        case akns_discretization_ES8:
+            if (D/upsampling_factor > (UINT)-1/(es_numel*sizeof(COMPLEX))) {
+                ret_code = E_INVALID_ARGUMENT(D);
+                goto leave_fun;
             }
-            for (UINT n = 0; n < D; n+=3){
-                tmp1[n] = eps_t_3*(q[n+2]+r[n+2])/48.0 + (eps_t*(q[n]+r[n]))*0.5;
-                tmp1[n+1] = (eps_t*(q[n]-r[n])*I)*0.5 + (eps_t_3*(q[n+2]-r[n+2])*I)/48.0;
-                tmp1[n+2] = -eps_t_3*(q[n]*r[n+1]- q[n+1]*r[n])/12.0;
-            }
-            if (derivative_flag == 1){
-                tmp2 = &tmp1[D];
-                for (UINT n = 0; n < D; n+=3){
-                    tmp2[n] = I*eps_t_3*(q[n+1]-r[n+1])/12.0;
-                    tmp2[n+1] = -eps_t_3*(q[n+1]+r[n+1])/12.0;
-                    tmp2[n+2] = -I*eps_t;
-                }
-            }
+            tmp1 = malloc(es_numel*(D/upsampling_factor)*sizeof(COMPLEX));
+            CHECK_NOMEM(tmp1,ret_code,leave_fun);
+            for (UINT n=0, node=0; n<D; n+=upsampling_factor, node++)
+                fnft__akns_es_z_coefficients(upsampling_factor+1,
+                        &q[n],&r[n],&tmp1[es_numel*node]);
             break;
 
         case akns_discretization_TES4:
@@ -532,13 +581,11 @@ INT akns_scatter_matrix(UINT const D,
         case akns_discretization_CF4_3:         // commutator-free fourth-order
         case akns_discretization_CF5_3:         // commutator-free fifth-order
         case akns_discretization_CF6_4:         // commutator-free sixth-order
-            N++;                                // The previous three discretizations require N=3
             // fall through
         case akns_discretization_CF4_2:         // commutator-free fourth-order
-            N++;                                // The previous discretization requires N=2
             // fall through
         case akns_discretization_BO:            // bofetta-osborne scheme
-            N++;                                // The previous discretization requires N=1
+        {
             COMPLEX *qr_weights = NULL;
             ret_code = akns_discretization_method_weights(&qr_weights,&eps_t_scaled,discretization);
             CHECK_RETCODE(ret_code, leave_fun_no_eps_t_scaled); // if ret_code != SUCCESS, akns_discretization_method_weights frees qr_weights and eps_t_scaled if needed
@@ -546,6 +593,7 @@ INT akns_scatter_matrix(UINT const D,
             for (UINT n=0; n<upsampling_factor; n++ )
                 eps_t_scaled[n] *= eps_t;
             break;
+        }
             
         default: // Unknown discretization
             ret_code = E_INVALID_ARGUMENT(>discretization);
@@ -580,20 +628,6 @@ INT akns_scatter_matrix(UINT const D,
                         W[i] = Wi;
                     break;
 
-                case akns_discretization_ES4:
-                    for (UINT n = 0; n < D; n+=3){
-                        COMPLEX a1 = tmp1[n]+ eps_t_3*(l_curr*I*(q[n+1]-r[n+1]))/12.0;
-                        COMPLEX a2 = tmp1[n+1] - eps_t_3*l_curr*(q[n+1]+r[n+1])/12.0;
-                        COMPLEX a3 = - eps_t*I*l_curr +tmp1[n+2];
-                        akns_scatter_U_ES4(a1,a2,a3,1,*U,&tmp2[n]);
-                        misc_matrix_mult(4,4,4,&U[0][0],&H[current][0][0],&H[!current][0][0]);
-                        current = !current;
-                        if (W != NULL)
-                            Wi += misc_normalize_vector(16, &H[current][0][0]);
-                    }
-                    if (W != NULL)
-                        W[i] = Wi;
-                    break;
                 case akns_discretization_TES4:
                     for (UINT n = 0; n < D; n+=3){
                         COMPLEX M[2][2];
@@ -634,24 +668,18 @@ INT akns_scatter_matrix(UINT const D,
                     if (W != NULL)
                         W[i] = Wi;
                     break;
+                case akns_discretization_ES4:
                 case akns_discretization_ES6:
-                    for (UINT n = 0; n < D; n+=5) {
-                        akns_scatter_U_ES6(&q[n],&r[n],l_curr,eps_t,1,0,*U);
-                        misc_matrix_mult(4,4,4,&U[0][0],&H[current][0][0],&H[!current][0][0]);
-                        current = !current;
-                        if (W != NULL)
-                            Wi += misc_normalize_vector(16, &H[current][0][0]);
-                    }
-                    if (W != NULL)
-                        W[i] = Wi;
-                    break;
                 case akns_discretization_ES8:
-                    for (UINT n = 0, node=0; n < D; n+=7, node++) {
-                        akns_scatter_U_ES8(&tmp1[24*node],l_curr,eps_t,1,0,*U);
+                    for (UINT n = 0, node=0; n < D; n+=upsampling_factor, node++) {
+                        ret_code = akns_scatter_U_ES(&tmp1[es_numel*node],
+                                es_degree,l_curr,eps_t,pade,1,0,*U);
+                        CHECK_RETCODE(ret_code, leave_fun);
                         misc_matrix_mult(4,4,4,&U[0][0],&H[current][0][0],&H[!current][0][0]);
                         current = !current;
                         if (W != NULL)
-                            Wi += misc_normalize_vector(16,&H[current][0][0]);
+                            Wi += akns_scatter_normalize_ES_vector(16,
+                                    &H[current][0][0]);
                     }
                     if (W != NULL)
                         W[i] = Wi;
@@ -689,6 +717,31 @@ INT akns_scatter_matrix(UINT const D,
             result[8*i + 6] = H[current][3][0];
             result[8*i + 7] = H[current][3][1];
         }
+    } else if (first_column_flag) {
+        for (UINT i=0; i<K; i++) {
+            const COMPLEX l_curr = lambda[i];
+            COMPLEX H[2][2] = {{1.0,0.0}};
+            UINT current = 0;
+            INT Wi = 0;
+
+            for (UINT n=0, node=0; n<D;
+                    n+=upsampling_factor, node++) {
+                COMPLEX U[2][2] = {{0}};
+
+                ret_code = akns_scatter_U_ES(&tmp1[es_numel*node],
+                        es_degree,l_curr,eps_t,pade,0,0,*U);
+                CHECK_RETCODE(ret_code, leave_fun);
+                akns_scatter_apply_U_ES(&U[0][0],2,H[current],1,
+                        H[!current],1);
+                current = !current;
+                if (W != NULL)
+                    Wi += akns_scatter_normalize_ES_vector(2,H[current]);
+            }
+            result[i] = H[current][0];
+            result_second[i] = H[current][1];
+            if (W != NULL)
+                W[i] = Wi;
+        }
     } else {
         // Calculate the scattering matrix without lambda-derivative
         for (UINT i = 0; i < K; i++) { // iterate over lambda
@@ -712,23 +765,6 @@ INT akns_scatter_matrix(UINT const D,
                         current = !current;
                         if (W != NULL)
                             Wi += misc_normalize_vector(4, &H[current][0][0]);
-                    }
-                    if (W != NULL)
-                        W[i] = Wi;
-                    break;
-
-                case akns_discretization_ES4:
-                    for (UINT n = 0; n < D; n+=3){
-                        COMPLEX U[2][2];
-
-                        COMPLEX a1 = tmp1[n]+ eps_t_3*(l_curr*I*(q[n+1]-r[n+1]))/12.0;
-                        COMPLEX a2 = tmp1[n+1] - eps_t_3*l_curr*(q[n+1]+r[n+1])/12.0;
-                        COMPLEX a3 = - eps_t*I*l_curr +tmp1[n+2];
-                        akns_scatter_U_ES4(a1,a2,a3,0,*U,NULL);
-                        misc_matrix_mult(2,2,2,&U[0][0],&H[current][0][0],&H[!current][0][0]);
-                        current = !current;
-                        if (W != NULL)
-                            Wi += misc_normalize_vector(4, &H[current][0][0]);                      
                     }
                     if (W != NULL)
                         W[i] = Wi;
@@ -773,26 +809,22 @@ INT akns_scatter_matrix(UINT const D,
                     if (W != NULL)
                         W[i] = Wi;
                     break;
+                case akns_discretization_ES4:
                 case akns_discretization_ES6:
-                    for (UINT n = 0; n < D; n+=5) {
-                        COMPLEX U[2][2] = {{0}};
-                        akns_scatter_U_ES6(&q[n],&r[n],l_curr,eps_t,0,0,*U);
-                        misc_matrix_mult(2,2,2,&U[0][0],&H[current][0][0],&H[!current][0][0]);
-                        current = !current;
-                        if (W != NULL)
-                            Wi += misc_normalize_vector(4, &H[current][0][0]);
-                    }
-                    if (W != NULL)
-                        W[i] = Wi;
-                    break;
                 case akns_discretization_ES8:
-                    for (UINT n = 0, node=0; n < D; n+=7, node++) {
+                    for (UINT n = 0, node=0; n < D; n+=upsampling_factor, node++) {
                         COMPLEX U[2][2] = {{0}};
-                        akns_scatter_U_ES8(&tmp1[24*node],l_curr,eps_t,0,0,*U);
-                        misc_matrix_mult(2,2,2,&U[0][0],&H[current][0][0],&H[!current][0][0]);
+                        ret_code = akns_scatter_U_ES(&tmp1[es_numel*node],
+                                es_degree,l_curr,eps_t,pade,0,0,*U);
+                        CHECK_RETCODE(ret_code, leave_fun);
+                        akns_scatter_apply_U_ES(&U[0][0],2,
+                                &H[current][0][0],2,&H[!current][0][0],2);
+                        akns_scatter_apply_U_ES(&U[0][0],2,
+                                &H[current][0][1],2,&H[!current][0][1],2);
                         current = !current;
                         if (W != NULL)
-                            Wi += misc_normalize_vector(4,&H[current][0][0]);
+                            Wi += akns_scatter_normalize_ES_vector(4,
+                                    &H[current][0][0]);
                     }
                     if (W != NULL)
                         W[i] = Wi;
@@ -832,10 +864,64 @@ leave_fun_no_eps_t_scaled:
     return ret_code;
 }
 
+INT akns_scatter_matrix(UINT const D,
+                        COMPLEX const * const q,
+                        COMPLEX const * const r,
+                        REAL const eps_t,
+                        UINT const K,
+                        COMPLEX const * const lambda,
+                        COMPLEX * const result,
+                        INT * const W,
+                        akns_discretization_t const discretization,
+                        akns_pde_t const PDE,
+                        UINT const vanilla_flag,
+                        UINT const derivative_flag)
+{
+    return akns_scatter_matrix_impl(D,q,r,eps_t,K,lambda,result,NULL,W,
+            discretization,PDE,vanilla_flag,0,derivative_flag,0);
+}
+
+INT akns_scatter_matrix_pade(UINT const D,
+                        COMPLEX const * const q,
+                        COMPLEX const * const r,
+                        REAL const eps_t,
+                        UINT const K,
+                        COMPLEX const * const lambda,
+                        COMPLEX * const result,
+                        INT * const W,
+                        akns_discretization_t const discretization,
+                        akns_pde_t const PDE,
+                        UINT const vanilla_flag,
+                        UINT const pade_degree,
+                        UINT const derivative_flag)
+{
+    if (pade_degree == 0)
+        return E_INVALID_ARGUMENT(pade_degree);
+    return akns_scatter_matrix_impl(D,q,r,eps_t,K,lambda,result,NULL,W,
+            discretization,PDE,vanilla_flag,pade_degree,
+            derivative_flag,0);
+}
+
+INT akns_scatter_matrix_first_column(UINT const D,
+                        COMPLEX const * const q,
+                        COMPLEX const * const r,
+                        REAL const eps_t,
+                        UINT const K,
+                        COMPLEX const * const lambda,
+                        COMPLEX * const H11,
+                        COMPLEX * const H21,
+                        INT * const W,
+                        akns_discretization_t const discretization,
+                        UINT const pade_degree)
+{
+    return akns_scatter_matrix_impl(D,q,r,eps_t,K,lambda,H11,H21,W,
+            discretization,akns_pde_NSE,0,pade_degree,0,1);
+}
+
 /**
  * Returns the a, a_prime and b computed using the chosen scheme.
  */
-INT akns_scatter_bound_states(UINT const D,
+static INT akns_scatter_bound_states_impl(UINT const D,
                               COMPLEX const * const q,
                               COMPLEX const * const r,
                               REAL const *const T,
@@ -845,10 +931,11 @@ INT akns_scatter_bound_states(UINT const D,
                               COMPLEX * const aprime_vals,
                               COMPLEX * const b_vals,
                               INT * const Ws,
-                              akns_discretization_t const discretization,
-                              akns_pde_t const PDE,
-                              UINT const vanilla_flag,
-                              UINT const skip_b_flag)
+                               akns_discretization_t const discretization,
+                               akns_pde_t const PDE,
+                               UINT const vanilla_flag,
+                               UINT const pade_degree,
+                               UINT const skip_b_flag)
 {
     INT ret_code = SUCCESS;
 
@@ -871,6 +958,11 @@ INT akns_scatter_bound_states(UINT const D,
         return E_INVALID_ARGUMENT(a_prime);
     if (!skip_b_flag && b_vals == NULL)
         return E_INVALID_ARGUMENT(b);
+    if (pade_degree > 7 || (pade_degree != 0
+            && discretization != akns_discretization_ES4
+            && discretization != akns_discretization_ES6
+            && discretization != akns_discretization_ES8))
+        return E_INVALID_ARGUMENT(pade_degree);
     UINT const upsampling_factor = akns_discretization_upsampling_factor(discretization);
     if (upsampling_factor == 0)
         return E_INVALID_ARGUMENT(discretization);
@@ -879,9 +971,26 @@ INT akns_scatter_bound_states(UINT const D,
         return E_INVALID_ARGUMENT(>discretization);
     if (D%upsampling_factor != 0)
         return E_ASSERTION_FAILED;
+    const UINT es_degree = upsampling_factor >= 3 ? upsampling_factor-2 : 0;
+    const UINT es_numel = 4*(es_degree+1);
     UINT const D_given = D/upsampling_factor;
     if (PDE!=akns_pde_KdV && PDE!=akns_pde_NSE)
         return E_INVALID_ARGUMENT(PDE);
+    REAL pade_F[8], pade_G[7], pade_denominator[8];
+    akns_scatter_pade_coefficients_t pade_coefficients;
+    akns_scatter_pade_coefficients_t const *pade = NULL;
+
+    if (pade_degree != 0) {
+        ret_code = akns_pade_coefficients(pade_degree,pade_F,pade_G,
+                pade_denominator);
+        if (ret_code != SUCCESS)
+            return ret_code;
+        pade_coefficients.degree = pade_degree;
+        pade_coefficients.F = pade_F;
+        pade_coefficients.G = pade_G;
+        pade_coefficients.denominator = pade_denominator;
+        pade = &pade_coefficients;
+    }
 
     // Declare pointers that may or may not be used, depending on the discretization.
     // We must do so before possibly jumping to leave_fun.
@@ -921,37 +1030,24 @@ INT akns_scatter_bound_states(UINT const D,
 
     // Pre-computing weights required for higher-order CF methods that are
     // independent of q, r and l.
-    // In the case of ES4 and TES4 computing values that are functions of
-    // q and r but not l.
+    // For ES4/ES6/ES8, precompute the coefficients of Z(eps_t*l);
+    // for TES4, precompute the outer matrix exponentials.
 
-    UINT N = 0;
     switch (discretization) {
         case akns_discretization_CT4:
-        case akns_discretization_ES6:
             break;
-        case akns_discretization_ES8:
-            tmp1 = malloc(24*(D/7)*sizeof(COMPLEX));
-            CHECK_NOMEM(tmp1,ret_code,leave_fun);
-            for (UINT n=0, node=0; n<D; n+=7, node++)
-                fnft__akns_es8_z_coefficients(&q[n],&r[n],&tmp1[24*node]);
-            break;
-        // Fourth-order exponential method which requires
-        // one matrix exponential. The matrix exponential is
-        // implmented by using the expansion of the 2x2 matrix
-        // in terms of Pauli matrices.
         case akns_discretization_ES4:
-            tmp1 = malloc(2*D*sizeof(COMPLEX));
-            CHECK_NOMEM(tmp1, ret_code, leave_fun);
-            tmp2 = &tmp1[D];
-            for (UINT n=0; n<D; n+=3){
-                tmp1[n] = eps_t_3*(q[n+2]+r[n+2])/48.0 + (eps_t*(q[n]+r[n]))*0.5;
-                tmp1[n+1] = (eps_t*(q[n]-r[n])*I)*0.5 + (eps_t_3*(q[n+2]-r[n+2])*I)/48.0;
-                tmp1[n+2] = -eps_t_3*(q[n]*r[n+1]- q[n+1]*r[n])/12.0;
-
-                tmp2[n] = I*eps_t_3*(q[n+1]-r[n+1])/12.0;
-                tmp2[n+1] = -eps_t_3*(q[n+1]+r[n+1])/12.0;
-                tmp2[n+2] = -I*eps_t;
+        case akns_discretization_ES6:
+        case akns_discretization_ES8:
+            if (D/upsampling_factor > (UINT)-1/(es_numel*sizeof(COMPLEX))) {
+                ret_code = E_INVALID_ARGUMENT(D);
+                goto leave_fun;
             }
+            tmp1 = malloc(es_numel*(D/upsampling_factor)*sizeof(COMPLEX));
+            CHECK_NOMEM(tmp1,ret_code,leave_fun);
+            for (UINT n=0, node=0; n<D; n+=upsampling_factor, node++)
+                fnft__akns_es_z_coefficients(upsampling_factor+1,
+                        &q[n],&r[n],&tmp1[es_numel*node]);
             break;
 
             //  Fourth-order exponential method which requires
@@ -985,13 +1081,11 @@ INT akns_scatter_bound_states(UINT const D,
         case akns_discretization_CF4_3:         // commutator-free fourth-order
         case akns_discretization_CF5_3:         // commutator-free fifth-order
         case akns_discretization_CF6_4:         // commutator-free sixth-order
-            N++;                                // The previous three discretizations require N=3
             // fall through
         case akns_discretization_CF4_2:         // commutator-free fourth-order
-            N++;                                // The previous discretization requires N=2
             // fall through
         case akns_discretization_BO:            // bofetta-osborne scheme
-            N++;                                // The previous discretization requires N=1
+        {
             COMPLEX *qr_weights = NULL;
             ret_code = akns_discretization_method_weights(&qr_weights,&eps_t_scaled,discretization);
             CHECK_RETCODE(ret_code, leave_fun_no_eps_t_scaled); // if ret_code != SUCCESS, akns_discretization_method_weights frees qr_weights and eps_t_scaled if needed
@@ -999,6 +1093,7 @@ INT akns_scatter_bound_states(UINT const D,
             for (UINT n=0; n<upsampling_factor; n++ )
                 eps_t_scaled[n] *= eps_t;
             break;
+        }
 
         default: // Unknown discretization
             ret_code = E_INVALID_ARGUMENT(discretization);
@@ -1061,25 +1156,6 @@ INT akns_scatter_bound_states(UINT const D,
             break;
 
             // Fourth-order exponential method which requires
-            // one matrix exponential. The matrix exponential is
-            // implmented by using the expansion of the 2x2 matrix
-            // in terms of Pauli matrices.
-            case akns_discretization_ES4:
-                for (UINT n = 0, n_given=0; n<D; n+=3, n_given++) {
-                    COMPLEX a1 = tmp1[n]+ eps_t_3*(l_curr*I*(q[n+1]-r[n+1]))/12.0;
-                    COMPLEX a2 = tmp1[n+1] - eps_t_3*l_curr*(q[n+1]+r[n+1])/12.0;
-                    COMPLEX a3 = - eps_t*I*l_curr +tmp1[n+2];
-                    akns_scatter_U_ES4(a1,a2,a3,1,*U,&tmp2[n]);                   
-                    misc_matrix_mult(4,4,1,*U,&PHI[4*n_given],&PHI[4*(n_given+1)]);
-                    if (normalization_flag) {
-                        WPHI_acc += misc_normalize_vector(4, &PHI[4*(n_given+1)]);
-                        if (WPHI != NULL)
-                            WPHI[n_given+1] = WPHI_acc;
-                    }                  
-                }
-                break;
-
-            // Fourth-order exponential method which requires
             // three matrix exponentials. The outer two transfer metrices
             // need to be built differently compared to the CF schemes.
             case akns_discretization_TES4:
@@ -1121,23 +1197,18 @@ INT akns_scatter_bound_states(UINT const D,
                     }
                 }
                 break;
+            case akns_discretization_ES4:
             case akns_discretization_ES6:
-                for (UINT n=0, n_given=0; n<D; n+=5, n_given++) {
-                    akns_scatter_U_ES6(&q[n],&r[n],l_curr,eps_t,1,0,*U);
-                    misc_matrix_mult(4,4,1,*U,&PHI[4*n_given],&PHI[4*(n_given+1)]);
-                    if (normalization_flag) {
-                        WPHI_acc += misc_normalize_vector(4, &PHI[4*(n_given+1)]);
-                        if (WPHI != NULL)
-                            WPHI[n_given+1] = WPHI_acc;
-                    }
-                }
-                break;
             case akns_discretization_ES8:
-                for (UINT n=0, n_given=0; n<D; n+=7, n_given++) {
-                    akns_scatter_U_ES8(&tmp1[24*n_given],l_curr,eps_t,1,0,*U);
-                    misc_matrix_mult(4,4,1,*U,&PHI[4*n_given],&PHI[4*(n_given+1)]);
+                for (UINT n=0, n_given=0; n<D; n+=upsampling_factor, n_given++) {
+                    ret_code = akns_scatter_U_ES(&tmp1[es_numel*n_given],
+                            es_degree,l_curr,eps_t,pade,1,0,*U);
+                    CHECK_RETCODE(ret_code, leave_fun);
+                    akns_scatter_apply_U_ES_derivative(&U[0][0],
+                            &PHI[4*n_given],&PHI[4*(n_given+1)]);
                     if (normalization_flag) {
-                        WPHI_acc += misc_normalize_vector(4,&PHI[4*(n_given+1)]);
+                        WPHI_acc += akns_scatter_normalize_ES_vector(4,
+                                &PHI[4*(n_given+1)]);
                         if (WPHI != NULL)
                             WPHI[n_given+1] = WPHI_acc;
                     }
@@ -1197,25 +1268,6 @@ INT akns_scatter_bound_states(UINT const D,
                 }
 
                 // Fourth-order exponential method which requires
-                // one matrix exponential. The matrix exponential is
-                // implmented by using the expansion of the 2x2 matrix
-                // in terms of Pauli matrices.
-                case akns_discretization_ES4:
-                    for (UINT n_given=D_given, n=D-3; n_given-->0; n-=3) {
-                        COMPLEX U[2][2];
-                        COMPLEX a1 = -tmp1[n]- eps_t_3*(l_curr*I*(q[n+1]-r[n+1]))/12.0;
-                        COMPLEX a2 = -tmp1[n+1] + eps_t_3*l_curr*(q[n+1]+r[n+1])/12.0;
-                        COMPLEX a3 =  eps_t*I*l_curr -tmp1[n+2];
-                        akns_scatter_U_ES4(a1,a2,a3,0,*U,NULL);
-                        misc_matrix_mult(2,2,1,*U,&PSI[4*(n_given+1)],&PSI[4*n_given]);
-                        if (normalization_flag) {
-                            WPSI_acc += misc_normalize_vector(2, &PSI[4*n_given]);
-                            WPSI[n_given] = WPSI_acc;
-                        }
-                    }
-                    break;
-
-                // Fourth-order exponential method which requires
                 // three matrix exponentials. The transfer metrix cannot
                 // needs to be built differently compared to the CF schemes.
                 case akns_discretization_TES4:
@@ -1254,24 +1306,20 @@ INT akns_scatter_bound_states(UINT const D,
                         }
                     }
                     break;
+                case akns_discretization_ES4:
                 case akns_discretization_ES6:
-                    for (UINT n_given=D_given, n=D-5; n_given-->0; n-=5) {
-                        COMPLEX U[2][2] = {{0}};
-                        akns_scatter_U_ES6(&q[n],&r[n],l_curr,eps_t,0,1,*U);
-                        misc_matrix_mult(2,2,1,*U,&PSI[4*(n_given+1)],&PSI[4*n_given]);
-                        if (normalization_flag) {
-                            WPSI_acc += misc_normalize_vector(2, &PSI[4*n_given]);
-                            WPSI[n_given] = WPSI_acc;
-                        }
-                    }
-                    break;
                 case akns_discretization_ES8:
-                    for (UINT n_given=D_given, n=D-7; n_given-->0; n-=7) {
+                    for (UINT n_given=D_given; n_given-->0; ) {
                         COMPLEX U[2][2] = {{0}};
-                        akns_scatter_U_ES8(&tmp1[24*n_given],l_curr,eps_t,0,1,*U);
-                        misc_matrix_mult(2,2,1,*U,&PSI[4*(n_given+1)],&PSI[4*n_given]);
+                        ret_code = akns_scatter_U_ES(
+                                &tmp1[es_numel*n_given],es_degree,l_curr,
+                                eps_t,pade,0,1,*U);
+                        CHECK_RETCODE(ret_code, leave_fun);
+                        akns_scatter_apply_U_ES(&U[0][0],2,
+                                &PSI[4*(n_given+1)],1,&PSI[4*n_given],1);
                         if (normalization_flag) {
-                            WPSI_acc += misc_normalize_vector(2,&PSI[4*n_given]);
+                            WPSI_acc += akns_scatter_normalize_ES_vector(2,
+                                    &PSI[4*n_given]);
                             WPSI[n_given] = WPSI_acc;
                         }
                     }
@@ -1361,4 +1409,47 @@ leave_fun_no_eps_t_scaled:
     free(WPHI);
     free(WPSI);
     return ret_code;
+}
+
+INT akns_scatter_bound_states(UINT const D,
+                              COMPLEX const * const q,
+                              COMPLEX const * const r,
+                              REAL const *const T,
+                              UINT const K,
+                              COMPLEX const * const bound_states,
+                              COMPLEX * const a_vals,
+                              COMPLEX * const aprime_vals,
+                              COMPLEX * const b_vals,
+                              INT * const Ws,
+                              akns_discretization_t const discretization,
+                              akns_pde_t const PDE,
+                              UINT const vanilla_flag,
+                              UINT const skip_b_flag)
+{
+    return akns_scatter_bound_states_impl(D,q,r,T,K,bound_states,a_vals,
+            aprime_vals,b_vals,Ws,discretization,PDE,vanilla_flag,0,
+            skip_b_flag);
+}
+
+INT akns_scatter_bound_states_pade(UINT const D,
+                              COMPLEX const * const q,
+                              COMPLEX const * const r,
+                              REAL const *const T,
+                              UINT const K,
+                              COMPLEX const * const bound_states,
+                              COMPLEX * const a_vals,
+                              COMPLEX * const aprime_vals,
+                              COMPLEX * const b_vals,
+                              INT * const Ws,
+                              akns_discretization_t const discretization,
+                              akns_pde_t const PDE,
+                              UINT const vanilla_flag,
+                              UINT const pade_degree,
+                              UINT const skip_b_flag)
+{
+    if (pade_degree == 0)
+        return E_INVALID_ARGUMENT(pade_degree);
+    return akns_scatter_bound_states_impl(D,q,r,T,K,bound_states,a_vals,
+            aprime_vals,b_vals,Ws,discretization,PDE,vanilla_flag,pade_degree,
+            skip_b_flag);
 }

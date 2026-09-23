@@ -238,6 +238,39 @@ static inline void fnft__akns_es8_stencil(
             +15.0*qp1-6.0*qp2+qp3);
 }
 
+/* ES4, ES6 and ES8 use the same sample-major representation:
+ * eps_t^(j+1) q^(j), j=0,...,order-2. Finite differences are taken with
+ * respect to the grid index, so no inverse powers of eps_t are formed.
+ * The caller supplies order-1 samples, including boundary extension. */
+static inline void fnft__akns_es_stencil(
+        FNFT_UINT const order, FNFT_COMPLEX const * const samples,
+        FNFT_REAL const eps_t, FNFT_COMPLEX * const values)
+{
+    if (order == 4) {
+        values[0] = eps_t*samples[1];
+        values[1] = eps_t*(samples[2]-samples[0])/2.0;
+        values[2] = eps_t*(samples[2]-2.0*samples[1]+samples[0]);
+    } else if (order == 6) {
+        fnft__akns_es6_stencil_t stencil;
+        fnft__akns_discretization_es6_stencil(samples,eps_t,&stencil);
+        values[0] = stencil.value;
+        values[1] = stencil.first;
+        values[2] = stencil.second;
+        values[3] = stencil.third;
+        values[4] = stencil.fourth;
+    } else { /* order == 8 */
+        fnft__akns_es8_stencil_t stencil;
+        fnft__akns_es8_stencil(samples,eps_t,&stencil);
+        values[0] = stencil.value;
+        values[1] = stencil.first;
+        values[2] = stencil.second;
+        values[3] = stencil.third;
+        values[4] = stencil.fourth;
+        values[5] = stencil.fifth;
+        values[6] = stencil.sixth;
+    }
+}
+
 static inline void fnft__akns_es8_set_pauli_coefficient(
         FNFT_COMPLEX coeff[24], FNFT_UINT const k,
         FNFT_COMPLEX const a1, FNFT_COMPLEX const a2,
@@ -316,6 +349,51 @@ static inline void fnft__akns_es8_z_coefficients(
     fnft__akns_es8_set_pauli_coefficient(coeff,5,a1c5,a2c5,0.0);
 }
 
+/* Coefficients of Z(eps_t*lambda) for the ES family, in ascending
+ * powers, with four matrix entries per power. The degree is order-3;
+ * coeff therefore has 4*(order-2) entries. q and r use the common
+ * scaled representation produced by fnft__akns_es_stencil.
+ * ES6 uses Eqs. 65--67 of https://doi.org/10.1016/j.jcp.2021.110764;
+ * ES8 uses Eqs. 51--60 of arXiv:2608.11892v1. */
+static inline void fnft__akns_es_z_coefficients(
+        FNFT_UINT const order, FNFT_COMPLEX const * const q,
+        FNFT_COMPLEX const * const r, FNFT_COMPLEX * const coeff)
+{
+    if (order == 4) {
+        coeff[0] = (r[0]*q[1]-q[0]*r[1])/12.0;
+        coeff[1] = q[0]+q[2]/24.0;
+        coeff[2] = r[0]+r[2]/24.0;
+        coeff[3] = -coeff[0];
+        coeff[4] = -(FNFT_COMPLEX)I;
+        coeff[5] = (FNFT_COMPLEX)I*q[1]/6.0;
+        coeff[6] = -(FNFT_COMPLEX)I*r[1]/6.0;
+        coeff[7] = (FNFT_COMPLEX)I;
+    } else if (order == 6) {
+        coeff[0] = (15.0-q[0]*r[0])*(r[0]*q[1]-q[0]*r[1])/180.0
+                +(r[0]*q[3]-q[0]*r[3]+q[1]*r[2]-r[1]*q[2])/480.0;
+        coeff[1] = q[0]+q[0]*(r[0]*q[2]-q[0]*r[2])/360.0
+                +(q[0]*r[1]-r[0]*q[1])*q[1]/120.0
+                +q[2]/24.0+q[4]/1920.0;
+        coeff[2] = r[0]+r[0]*(q[0]*r[2]-r[0]*q[2])/360.0
+                +(r[0]*q[1]-q[0]*r[1])*r[1]/120.0
+                +r[2]/24.0+r[4]/1920.0;
+        coeff[4] = -(FNFT_COMPLEX)I*(1.0-(r[0]*q[2]+q[0]*r[2])/360.0
+                +q[1]*r[1]/60.0);
+        coeff[5] = (FNFT_COMPLEX)I*(q[1]/6.0+q[3]/240.0-q[0]*r[0]*q[1]/90.0);
+        coeff[6] = -(FNFT_COMPLEX)I*(r[1]/6.0+r[3]/240.0-q[0]*r[0]*r[1]/90.0);
+        coeff[8] = (r[0]*q[1]-q[0]*r[1])/180.0;
+        coeff[9] = -q[2]/180.0;
+        coeff[10] = -r[2]/180.0;
+        coeff[12] = 0.0;
+        coeff[13] = (FNFT_COMPLEX)I*q[1]/90.0;
+        coeff[14] = -(FNFT_COMPLEX)I*r[1]/90.0;
+        for (FNFT_UINT k=0; k<4; k++)
+            coeff[4*k+3] = -coeff[4*k];
+    } else { /* order == 8 */
+        fnft__akns_es8_z_coefficients(q,r,coeff);
+    }
+}
+
 /**
  * @brief  This routine preprocesses the signal by resampling and subsampling based on the discretization.
  * The preprocessing is necessary for higher-order methods.
@@ -323,6 +401,8 @@ static inline void fnft__akns_es8_z_coefficients(
  * This routine preprocess q to generate q_preprocessed and r_preprocessed
  * based on the discretization. The preprocessing may involve resampling
  * and sub-sampling.
+ * ES4, ES6 and ES8 store eps_t_sub^(j+1) times the j-th derivative,
+ * j=0,...,order-2. TES4 retains unscaled potential/derivative samples.
  * The routine is based on the following papers:
  *      - Chimmalgi, Prins and Wahls, <a href="https://doi.org/10.1109/ACCESS.2019.2945480">&quot; Fast Nonlinear Fourier Transform Algorithms Using Higher Order Exponential Integrators,&quot;</a> IEEE Access 7, 2019.
  *      - Medvedev, Vaseva, Chekhovskoy and  Fedoruk, <a href="https://doi.org/10.1364/OE.377140">&quot; Exponential fourth order schemes for direct Zakharov-Shabat problem,&quot;</a> Optics Express, vol. 28, pp. 20--39, 2020.

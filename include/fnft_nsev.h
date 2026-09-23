@@ -148,10 +148,12 @@ typedef enum {
  * fnft_nsev_pade_representation_CHEBYSHEV_JOUKOWSKI: For FES8_PADE, use
  * \f$\zeta=c+Hx\f$, \f$x=(w+w^{-1})/2\f$ and represent the transfer matrix
  * in Chebyshev polynomials. The coefficient product tree has complexity
- * \f$O(KD\log^2 D)\f$, where \f$K\f$ is the local polynomial degree. On the
- * uniform spectral grid required by \link fnft_nsev \endlink, dependency-free
- * Clenshaw evaluation has complexity \f$O(MKD)\f$; therefore this option does
- * not provide end-to-end \f$O(D\log^2 D)\f$ complexity when \f$M\sim D\f$.
+ * \f$O(KD\log^2 D)\f$, where \f$K\f$ is the local polynomial degree.
+ * With NFFT3 enabled (cmake option ENABLE_NFFT), polynomial evaluation on
+ * the uniform spectral grid uses a nonuniform Fourier transform. For fixed
+ * Padé degree and transform accuracy the complete continuous-spectrum cost
+ * is \f$O(D\log^2 D+M)\f$, hence \f$O(D\log^2 D)\f$ for \f$M=O(D)\f$.
+ * Without NFFT3, Clenshaw evaluation costs \f$O(MKD)\f$.
  */
 typedef enum {
     fnft_nsev_pade_representation_DIRECT_CAYLEY,
@@ -231,17 +233,21 @@ typedef enum {
  *  bounding_box[2] <= imag(lambda) <= bounding_box[3] \n
  *
  * @var fnft_nsev_opts_t::pade_degree
- *  Degree of the diagonal Padé approximant for FES4_PADE, FES6_PADE and
- *  FES8_PADE. Zero selects the family default (2 for FES4, 3 for FES6 and
- *  FES8). FES4 accepts degrees 2 through 7; FES6 and FES8 accept degrees 3
- *  through 7. For FES8, degree 3 has order six and degrees 4--7 have order
+ *  Degree of the diagonal Padé approximant. For ES4, ES6 and ES8, zero uses
+ *  the exact matrix exponential and values 1 through 7 select the [s/s]
+ *  approximant; degree 1 is the Cayley transform. The resulting effective
+ *  order is the smaller of the ES order and 2s. For FES4_PADE, FES6_PADE
+ *  and FES8_PADE, zero selects the family default (2 for FES4, 3 for FES6
+ *  and FES8). FES4 accepts degrees 2 through 7; FES6 and FES8 accept degrees
+ *  3 through 7. For FES8, degree 3 has order six and degrees 4--7 have order
  *  eight. All listed degrees are supported; the cited preprint reports
  *  numerical experiments for degrees 3--6.
  *
  * @var fnft_nsev_opts_t::pade_h
  *  Positive scale \f$h\f$ of the map
  *  \f$w=(ih-\epsilon_t\lambda)/(ih+\epsilon_t\lambda)\f$ used by the Padé
- *  schemes. Zero selects a degree-specific default. For FES6, degrees 3 and
+ *  fast Padé schemes. It is ignored by slow ES4, ES6 and ES8. Zero selects a
+ *  degree-specific default. For FES6, degrees 3 and
  *  4 use the empirically optimized values 11 and 15 reported in the cited
  *  J. Comput. Phys. article. For compatibility with the original
  *  implementation, FES6 degrees 5--7 use 19.4, 23.2 and 26.9, while FES4
@@ -374,12 +380,13 @@ FNFT_UINT fnft_nsev_max_K(const FNFT_UINT D,
  *       - fnft_nse_discretization_FES6_PADE
  *       - fnft_nse_discretization_FES8_PADE
  *
- *  FES8_PADE can use either the direct-Cayley power-basis representation or
- *  the Chebyshev--Joukowski representation for the continuous spectrum. The
- *  latter builds coefficients in \f$O(KD\log^2D)\f$, but evaluating them on
- *  this routine's uniform \f$\Xi\f$ grid by Clenshaw's recurrence costs
- *  \f$O(MKD)\f$. Discrete spectral data are supported with the NEWTON and
- *  SUBSAMPLE_AND_REFINE localization methods.
+ *  For the Padé families, the fast continuous-spectrum complexity above
+ *  requires NFFT3 support (cmake option ENABLE_NFFT), fixed Padé degree and
+ *  fixed transform accuracy. This applies to both direct-Cayley and
+ *  Chebyshev--Joukowski representations. Without NFFT3, the final polynomial
+ *  evaluation uses Horner/Clenshaw recurrences and costs \f$O(MKD)\f$.
+ *  FES8_PADE supports discrete spectral data with NEWTON and
+ *  SUBSAMPLE_AND_REFINE; their cost is separate from the continuous spectrum.
  *
  * The following discretizations use classical algorithms which have a computational
  * complexity of \f$ \mathcal{O}(D^2)\f$ for \f$ D\f$ point continuous spectrum given \f$ D\f$ samples:
@@ -411,7 +418,9 @@ FNFT_UINT fnft_nsev_max_K(const FNFT_UINT D,
  * @param[in] T Array of length 2, contains the position in time of the first and
  *  of the last sample. It should be \f$T[0]<T[1]\f$.
  * @param[in] M Number of points at which the continuous spectrum (aka
- *  reflection coefficient) should be computed.
+ *  reflection coefficient) should be computed. Use M >= 2 when computing
+ *  the continuous spectrum; M = 0 skips that computation even if contspec
+ *  is not NULL.
  * @param[out] contspec Array of length M in which the routine will store the
  *  desired samples \f$ r(\xi_m) \f$ of the continuous spectrum (aka
  *  reflection coefficient) in ascending order,
@@ -422,7 +431,7 @@ FNFT_UINT fnft_nsev_max_K(const FNFT_UINT D,
  *  instead. In that case, twice the amount of memory has to be allocated.
  * @param[in] XI Array of length 2, contains the position of the first and the last
  *  sample of the continuous spectrum. It should be \f$XI[0]<XI[1]\f$. Can also be
- *  NULL if contspec==NULL.
+ *  NULL if contspec==NULL or M==0.
  * @param[in,out] K_ptr Upon entry, *K_ptr should contain the length of the array
  *  bound_states. Upon return, *K_ptr contains the number of actually detected
  *  bound states. If the length of the array bound_states was not sufficient
