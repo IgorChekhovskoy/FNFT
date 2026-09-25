@@ -299,18 +299,39 @@ static inline INT akns_scatter_normalize_ES_vector(UINT const len,
     return misc_normalize_vector(len,v);
 }
 
+/* Some C toolchains lower every complex product to a runtime call.
+ * Keep finite products inline without enabling unsafe global math flags. */
+static inline COMPLEX akns_scatter_ES_multiply(COMPLEX const a,
+                                                COMPLEX const b)
+{
+#if defined(__MINGW32__) && defined(__GNUC__) && !defined(__clang__)
+    const REAL ar = CREAL(a), ai = CIMAG(a);
+    const REAL br = CREAL(b), bi = CIMAG(b);
+    const REAL parts[2] = {ar*br-ai*bi,ar*bi+ai*br};
+    COMPLEX value;
+
+    if (!isfinite(parts[0]) || !isfinite(parts[1]))
+        return a*b;
+    memcpy(&value,parts,sizeof(value));
+    return value;
+#else
+    return a*b;
+#endif
+}
+
 static inline void akns_scatter_apply_U_ES(
         COMPLEX const * const U, UINT const U_stride,
         COMPLEX const * const v, UINT const v_stride,
         COMPLEX * const result, UINT const result_stride)
 {
-    result[0] = U[0]*v[0]+U[1]*v[v_stride];
-    result[result_stride] = U[U_stride]*v[0]
-            +U[U_stride+1]*v[v_stride];
+    result[0] = akns_scatter_ES_multiply(U[0],v[0])
+            +akns_scatter_ES_multiply(U[1],v[v_stride]);
+    result[result_stride] = akns_scatter_ES_multiply(U[U_stride],v[0])
+            +akns_scatter_ES_multiply(U[U_stride+1],v[v_stride]);
 }
 
 static inline void akns_scatter_apply_U_ES_derivative(
-        COMPLEX const U[16], COMPLEX const v[4], COMPLEX result[4])
+        COMPLEX const * const U, COMPLEX const v[4], COMPLEX result[4])
 {
     COMPLEX derivative_part[2];
 
@@ -321,6 +342,141 @@ static inline void akns_scatter_apply_U_ES_derivative(
     result[3] += derivative_part[1];
 }
 
+enum { AKNS_SCATTER_ES_BLOCK_SIZE = 32 };
+
+/* Independent local transitions are built in small blocks. The real and
+ * imaginary lanes let the compiler vectorize their polynomial arithmetic;
+ * propagation and normalization still occur in the original node order. */
+static inline void akns_scatter_ES_polynomial_block(
+        COMPLEX const * const coeff, UINT const degree, COMPLEX const z,
+        UINT const count, COMPLEX result[AKNS_SCATTER_ES_BLOCK_SIZE][4])
+{
+    REAL re[3][AKNS_SCATTER_ES_BLOCK_SIZE];
+    REAL im[3][AKNS_SCATTER_ES_BLOCK_SIZE];
+    const UINT stride = 4*(degree+1);
+    const REAL zr = CREAL(z), zi = CIMAG(z);
+
+    /* A linear polynomial needs no intermediate Horner arrays. */
+    if (degree == 1 && zi == 0.0 && isfinite(zr)) {
+        INT finite = 1;
+        for (UINT n=0; n<count; n++) {
+            for (UINT j=0; j<3; j++) {
+                const REAL parts[2] = {
+                    CREAL(coeff[stride*n+4+j])*zr+CREAL(coeff[stride*n+j]),
+                    CIMAG(coeff[stride*n+4+j])*zr+CIMAG(coeff[stride*n+j])
+                };
+                memcpy(&result[n][j],parts,sizeof(COMPLEX));
+                finite &= isfinite(parts[0]) & isfinite(parts[1]);
+            }
+        }
+        if (!finite) {
+            for (UINT n=0; n<count; n++) {
+                for (UINT j=0; j<3; j++) {
+                    if (!isfinite(CREAL(result[n][j]))
+                            || !isfinite(CIMAG(result[n][j])))
+                        result[n][j] = coeff[stride*n+4+j]*z+coeff[stride*n+j];
+                }
+            }
+        }
+        for (UINT n=0; n<count; n++)
+            result[n][3] = -result[n][0];
+        return;
+    }
+    for (UINT j=0; j<3; j++) {
+        for (UINT n=0; n<count; n++) {
+            re[j][n] = CREAL(coeff[stride*n+4*degree+j]);
+            im[j][n] = CIMAG(coeff[stride*n+4*degree+j]);
+        }
+    }
+    if (zi == 0.0 && isfinite(zr)) {
+        for (UINT k=degree; k-->0; ) {
+            for (UINT j=0; j<3; j++) {
+                for (UINT n=0; n<count; n++) {
+                    re[j][n] = re[j][n]*zr+CREAL(coeff[stride*n+4*k+j]);
+                    im[j][n] = im[j][n]*zr+CIMAG(coeff[stride*n+4*k+j]);
+                }
+            }
+        }
+    } else {
+        for (UINT k=degree; k-->0; ) {
+            for (UINT j=0; j<3; j++) {
+                for (UINT n=0; n<count; n++) {
+                    const REAL r = re[j][n], i = im[j][n];
+                    re[j][n] = r*zr-i*zi+CREAL(coeff[stride*n+4*k+j]);
+                    im[j][n] = r*zi+i*zr+CIMAG(coeff[stride*n+4*k+j]);
+                }
+            }
+        }
+    }
+    INT finite = 1;
+    for (UINT j=0; j<3; j++) {
+        for (UINT n=0; n<count; n++) {
+            const REAL parts[2] = {re[j][n],im[j][n]};
+            memcpy(&result[n][j],parts,sizeof(COMPLEX));
+            finite &= isfinite(parts[0]) & isfinite(parts[1]);
+        }
+    }
+    if (!finite) {
+        for (UINT n=0; n<count; n++) {
+            for (UINT j=0; j<3; j++) {
+                if (!isfinite(re[j][n]) || !isfinite(im[j][n])) {
+                    /* Retain C complex arithmetic at exceptional magnitudes. */
+                    result[n][j] = coeff[stride*n+4*degree+j];
+                    for (UINT k=degree; k-->0; )
+                        result[n][j] = result[n][j]*z+coeff[stride*n+4*k+j];
+                }
+            }
+        }
+    }
+    for (UINT n=0; n<count; n++)
+        result[n][3] = -result[n][0];
+}
+
+static inline void akns_scatter_ES_pade_block(COMPLEX const * const delta,
+        UINT const count, akns_scatter_pade_coefficients_t const * const pade,
+        COMPLEX result[AKNS_SCATTER_ES_BLOCK_SIZE][3])
+{
+    REAL re[3][AKNS_SCATTER_ES_BLOCK_SIZE];
+    REAL im[3][AKNS_SCATTER_ES_BLOCK_SIZE];
+    REAL dr[AKNS_SCATTER_ES_BLOCK_SIZE], di[AKNS_SCATTER_ES_BLOCK_SIZE];
+    const UINT degree = pade->degree;
+    REAL const * const coefficients[3] = {pade->F,pade->G,pade->denominator};
+
+    for (UINT n=0; n<count; n++) {
+        dr[n] = CREAL(delta[n]);
+        di[n] = CIMAG(delta[n]);
+    }
+    for (UINT j=0; j<3; j++) {
+        const UINT d = j == 1 ? degree-1 : degree;
+        for (UINT n=0; n<count; n++) {
+            re[j][n] = coefficients[j][d];
+            im[j][n] = 0.0;
+        }
+        for (UINT k=d; k-->0; ) {
+            for (UINT n=0; n<count; n++) {
+                const REAL r = re[j][n], i = im[j][n];
+                re[j][n] = r*dr[n]-i*di[n]+coefficients[j][k];
+                im[j][n] = r*di[n]+i*dr[n];
+            }
+        }
+        INT finite = 1;
+        for (UINT n=0; n<count; n++) {
+            const REAL parts[2] = {re[j][n],im[j][n]};
+            memcpy(&result[n][j],parts,sizeof(COMPLEX));
+            finite &= isfinite(parts[0]) & isfinite(parts[1]);
+        }
+        if (!finite) {
+            for (UINT n=0; n<count; n++) {
+                if (!isfinite(re[j][n]) || !isfinite(im[j][n])) {
+                    result[n][j] = coefficients[j][d];
+                    for (UINT k=d; k-->0; )
+                        result[n][j] = result[n][j]*delta[n]+coefficients[j][k];
+                }
+            }
+        }
+    }
+}
+
 static inline INT akns_scatter_U_ES(COMPLEX const * const coeff,
                                      UINT const degree,
                                      COMPLEX const lambda,
@@ -329,118 +485,128 @@ static inline INT akns_scatter_U_ES(COMPLEX const * const coeff,
                                         const pade,
                                      UINT const derivative_flag,
                                      UINT const inverse_flag,
-                                     COMPLEX * const U)
+                                     COMPLEX * const result, UINT const count)
 {
     const COMPLEX z = eps_t*lambda;
-    COMPLEX Z[4], Zd[4] = {0};
-    COMPLEX delta, delta_d = 0.0, f, g;
-    COMPLEX f_d = 0.0, g_d = 0.0;
+    COMPLEX Z_values[AKNS_SCATTER_ES_BLOCK_SIZE][4];
+    COMPLEX deltas[AKNS_SCATTER_ES_BLOCK_SIZE];
+    COMPLEX pade_values[AKNS_SCATTER_ES_BLOCK_SIZE][3];
     const REAL sign = inverse_flag ? -1.0 : 1.0;
     INT ret_code = SUCCESS;
 
-    /* Every coefficient produced by fnft__akns_es_z_coefficients is
-     * traceless. Evaluate the three independent entries and reconstruct
-     * the fourth one. */
-    for (UINT j=0; j<3; j++) {
-        Z[j] = coeff[4*degree+j];
-        for (UINT k=degree; k-->0; )
-            Z[j] = Z[j]*z+coeff[4*k+j];
+    akns_scatter_ES_polynomial_block(coeff,degree,z,count,Z_values);
+    for (UINT n=0; n<count; n++) {
+        COMPLEX const * const Z = Z_values[n];
+        deltas[n] = akns_scatter_ES_multiply(Z[0],Z[0])
+                +akns_scatter_ES_multiply(Z[1],Z[2]);
+    }
+    if (pade != NULL)
+        akns_scatter_ES_pade_block(deltas,count,pade,pade_values);
+
+    for (UINT n=0; n<count; n++) {
+        COMPLEX const * const Z = Z_values[n];
+        COMPLEX const * const node_coeff = coeff+4*(degree+1)*n;
+        COMPLEX * const U = result+(derivative_flag ? 16 : 4)*n;
+        const COMPLEX delta = deltas[n];
+        COMPLEX Zd[4] = {0}, f, g, f_d = 0.0, g_d = 0.0;
+        COMPLEX delta_d = 0.0;
         if (derivative_flag) {
-            Zd[j] = degree*coeff[4*degree+j];
-            for (UINT k=degree; k-->1; )
-                Zd[j] = Zd[j]*z+k*coeff[4*k+j];
-            Zd[j] *= eps_t;
+            for (UINT j=0; j<3; j++) {
+                Zd[j] = degree*node_coeff[4*degree+j];
+                for (UINT k=degree; k-->1; )
+                    Zd[j] = Zd[j]*z+k*node_coeff[4*k+j];
+                Zd[j] *= eps_t;
+            }
+            Zd[3] = -Zd[0];
+            delta_d = 2.0*Z[0]*Zd[0]+Zd[1]*Z[2]+Z[1]*Zd[2];
         }
-    }
-    Z[3] = -Z[0];
-    if (derivative_flag)
-        Zd[3] = -Zd[0];
+        if (pade == NULL) {
+            COMPLEX f_delta;
 
-    delta = Z[0]*Z[0]+Z[1]*Z[2];
-    if (derivative_flag) {
-        delta_d = 2.0*Z[0]*Zd[0]+Zd[1]*Z[2]+Z[1]*Zd[2];
-    }
-    if (pade == NULL) {
-        COMPLEX f_delta;
-
-        if (CABS(delta) < 1e-8) {
-            const COMPLEX delta2 = delta*delta;
-            const COMPLEX delta3 = delta2*delta;
-            const COMPLEX delta4 = delta3*delta;
-            f = 1.0+delta/2.0+delta2/24.0+delta3/720.0
-                    +delta4/40320.0;
-            g = 1.0+delta/6.0+delta2/120.0+delta3/5040.0
-                    +delta4/362880.0;
-            f_delta = 1.0/6.0+delta/60.0+delta2/1680.0
-                    +delta3/90720.0;
+            if (CABS(delta) < 1e-8) {
+                const COMPLEX delta2 = delta*delta;
+                const COMPLEX delta3 = delta2*delta;
+                const COMPLEX delta4 = delta3*delta;
+                f = 1.0+delta/2.0+delta2/24.0+delta3/720.0
+                        +delta4/40320.0;
+                g = 1.0+delta/6.0+delta2/120.0+delta3/5040.0
+                        +delta4/362880.0;
+                f_delta = 1.0/6.0+delta/60.0+delta2/1680.0
+                        +delta3/90720.0;
+            } else {
+                const COMPLEX root = CSQRT(delta);
+                fnft__akns_scatter_exact_scalar_pair(root,&f,&g);
+                if (derivative_flag)
+                    f_delta = (f-g)/(2.0*delta);
+            }
+            if (derivative_flag) {
+                f_d = 0.5*g*delta_d;
+                g_d = f_delta*delta_d;
+            }
         } else {
-            const COMPLEX root = CSQRT(delta);
-            fnft__akns_scatter_exact_scalar_pair(root,&f,&g);
-            f_delta = (f-g)/(2.0*delta);
+            const UINT pade_degree = pade->degree;
+            REAL const * const F_coeff = pade->F;
+            REAL const * const G_coeff = pade->G;
+            REAL const * const denominator_coeff = pade->denominator;
+            COMPLEX F, G, denominator, denominator_inverse;
+            COMPLEX F_delta = 0.0, G_delta = 0.0;
+            COMPLEX denominator_delta = 0.0;
+            F = pade_values[n][0];
+            G = pade_values[n][1];
+            denominator = pade_values[n][2];
+            if (denominator == 0.0) {
+                ret_code = E_DIV_BY_ZERO;
+                goto leave_fun;
+            }
+            {
+                const REAL ar = CREAL(denominator), ai = CIMAG(denominator);
+                const REAL square = ar*ar+ai*ai;
+                if (square >= DBL_MIN && square <= 1.0/DBL_MIN) {
+                    const REAL inv = 1.0/square;
+                    const REAL parts[2] = {ar*inv,-ai*inv};
+                    memcpy(&denominator_inverse,parts,sizeof(denominator_inverse));
+                } else {
+                    denominator_inverse = 1.0/denominator;
+                }
+            }
+            if (derivative_flag) {
+                F_delta = pade_degree*F_coeff[pade_degree];
+                denominator_delta = pade_degree
+                        *denominator_coeff[pade_degree];
+                for (UINT k=pade_degree; k-->1; ) {
+                    F_delta = F_delta*delta+k*F_coeff[k];
+                    denominator_delta = denominator_delta*delta
+                            +k*denominator_coeff[k];
+                }
+                if (pade_degree > 1) {
+                    G_delta = (pade_degree-1)*G_coeff[pade_degree-1];
+                    for (UINT k=pade_degree-1; k-->1; )
+                        G_delta = G_delta*delta+k*G_coeff[k];
+                }
+                f_d = (F_delta*denominator-F*denominator_delta)*delta_d
+                        *denominator_inverse*denominator_inverse;
+                g_d = (G_delta*denominator-G*denominator_delta)*delta_d
+                        *denominator_inverse*denominator_inverse;
+            }
+            f = akns_scatter_ES_multiply(F,denominator_inverse);
+            g = akns_scatter_ES_multiply(G,denominator_inverse);
         }
         if (derivative_flag) {
-            f_d = 0.5*g*delta_d;
-            g_d = f_delta*delta_d;
+            memset(U,0,16*sizeof(COMPLEX));
+            U[0] = U[10] = f+akns_scatter_ES_multiply(sign*g,Z[0]);
+            U[1] = U[11] = akns_scatter_ES_multiply(sign*g,Z[1]);
+            U[4] = U[14] = akns_scatter_ES_multiply(sign*g,Z[2]);
+            U[5] = U[15] = f+akns_scatter_ES_multiply(sign*g,Z[3]);
+            U[8] = f_d+sign*(g_d*Z[0]+g*Zd[0]);
+            U[9] = sign*(g_d*Z[1]+g*Zd[1]);
+            U[12] = sign*(g_d*Z[2]+g*Zd[2]);
+            U[13] = f_d+sign*(g_d*Z[3]+g*Zd[3]);
+        } else {
+            U[0] = f+akns_scatter_ES_multiply(sign*g,Z[0]);
+            U[1] = akns_scatter_ES_multiply(sign*g,Z[1]);
+            U[2] = akns_scatter_ES_multiply(sign*g,Z[2]);
+            U[3] = f+akns_scatter_ES_multiply(sign*g,Z[3]);
         }
-    } else {
-        const UINT pade_degree = pade->degree;
-        REAL const * const F_coeff = pade->F;
-        REAL const * const G_coeff = pade->G;
-        REAL const * const denominator_coeff = pade->denominator;
-        COMPLEX F, G, denominator, denominator_inverse;
-        COMPLEX F_delta = 0.0, G_delta = 0.0;
-        COMPLEX denominator_delta = 0.0;
-        F = F_coeff[pade_degree];
-        denominator = denominator_coeff[pade_degree];
-        for (UINT k=pade_degree; k-->0; ) {
-            F = F*delta+F_coeff[k];
-            denominator = denominator*delta+denominator_coeff[k];
-        }
-        G = G_coeff[pade_degree-1];
-        for (UINT k=pade_degree-1; k-->0; )
-            G = G*delta+G_coeff[k];
-        if (denominator == 0.0) {
-            ret_code = E_DIV_BY_ZERO;
-            goto leave_fun;
-        }
-        denominator_inverse = 1.0/denominator;
-        if (derivative_flag) {
-            F_delta = pade_degree*F_coeff[pade_degree];
-            denominator_delta = pade_degree
-                    *denominator_coeff[pade_degree];
-            for (UINT k=pade_degree; k-->1; ) {
-                F_delta = F_delta*delta+k*F_coeff[k];
-                denominator_delta = denominator_delta*delta
-                        +k*denominator_coeff[k];
-            }
-            if (pade_degree > 1) {
-                G_delta = (pade_degree-1)*G_coeff[pade_degree-1];
-                for (UINT k=pade_degree-1; k-->1; )
-                    G_delta = G_delta*delta+k*G_coeff[k];
-            }
-            f_d = (F_delta*denominator-F*denominator_delta)*delta_d
-                    *denominator_inverse*denominator_inverse;
-            g_d = (G_delta*denominator-G*denominator_delta)*delta_d
-                    *denominator_inverse*denominator_inverse;
-        }
-        f = F*denominator_inverse;
-        g = G*denominator_inverse;
-    }
-    if (derivative_flag) {
-        memset(U,0,16*sizeof(COMPLEX));
-        U[0] = U[10] = f+sign*g*Z[0];
-        U[1] = U[11] = sign*g*Z[1];
-        U[4] = U[14] = sign*g*Z[2];
-        U[5] = U[15] = f+sign*g*Z[3];
-        U[8] = f_d+sign*(g_d*Z[0]+g*Zd[0]);
-        U[9] = sign*(g_d*Z[1]+g*Zd[1]);
-        U[12] = sign*(g_d*Z[2]+g*Zd[2]);
-        U[13] = f_d+sign*(g_d*Z[3]+g*Zd[3]);
-    } else {
-        U[0] = f+sign*g*Z[0];
-        U[1] = sign*g*Z[1];
-        U[2] = sign*g*Z[2];
-        U[3] = f+sign*g*Z[3];
     }
     return SUCCESS;
 
@@ -671,15 +837,22 @@ static INT akns_scatter_matrix_impl(UINT const D,
                 case akns_discretization_ES4:
                 case akns_discretization_ES6:
                 case akns_discretization_ES8:
-                    for (UINT n = 0, node=0; n < D; n+=upsampling_factor, node++) {
+                    for (UINT node=0; node<D/upsampling_factor; ) {
+                        COMPLEX steps[AKNS_SCATTER_ES_BLOCK_SIZE][16];
+                        UINT count = D/upsampling_factor-node;
+                        if (count > AKNS_SCATTER_ES_BLOCK_SIZE)
+                            count = AKNS_SCATTER_ES_BLOCK_SIZE;
                         ret_code = akns_scatter_U_ES(&tmp1[es_numel*node],
-                                es_degree,l_curr,eps_t,pade,1,0,*U);
+                                es_degree,l_curr,eps_t,pade,1,0,steps[0],count);
                         CHECK_RETCODE(ret_code, leave_fun);
-                        misc_matrix_mult(4,4,4,&U[0][0],&H[current][0][0],&H[!current][0][0]);
-                        current = !current;
-                        if (W != NULL)
-                            Wi += akns_scatter_normalize_ES_vector(16,
-                                    &H[current][0][0]);
+                        for (UINT step=0; step<count; step++) {
+                            misc_matrix_mult(4,4,4,steps[step],&H[current][0][0],&H[!current][0][0]);
+                            current = !current;
+                            if (W != NULL)
+                                Wi += akns_scatter_normalize_ES_vector(16,
+                                        &H[current][0][0]);
+                        }
+                        node += count;
                     }
                     if (W != NULL)
                         W[i] = Wi;
@@ -724,18 +897,22 @@ static INT akns_scatter_matrix_impl(UINT const D,
             UINT current = 0;
             INT Wi = 0;
 
-            for (UINT n=0, node=0; n<D;
-                    n+=upsampling_factor, node++) {
-                COMPLEX U[2][2] = {{0}};
-
+            for (UINT node=0; node<D/upsampling_factor; ) {
+                COMPLEX steps[AKNS_SCATTER_ES_BLOCK_SIZE][4];
+                UINT count = D/upsampling_factor-node;
+                if (count > AKNS_SCATTER_ES_BLOCK_SIZE)
+                    count = AKNS_SCATTER_ES_BLOCK_SIZE;
                 ret_code = akns_scatter_U_ES(&tmp1[es_numel*node],
-                        es_degree,l_curr,eps_t,pade,0,0,*U);
+                        es_degree,l_curr,eps_t,pade,0,0,steps[0],count);
                 CHECK_RETCODE(ret_code, leave_fun);
-                akns_scatter_apply_U_ES(&U[0][0],2,H[current],1,
-                        H[!current],1);
-                current = !current;
-                if (W != NULL)
-                    Wi += akns_scatter_normalize_ES_vector(2,H[current]);
+                for (UINT step=0; step<count; step++) {
+                    akns_scatter_apply_U_ES(steps[step],2,H[current],1,
+                            H[!current],1);
+                    current = !current;
+                    if (W != NULL)
+                        Wi += akns_scatter_normalize_ES_vector(2,H[current]);
+                }
+                node += count;
             }
             result[i] = H[current][0];
             result_second[i] = H[current][1];
@@ -812,19 +989,25 @@ static INT akns_scatter_matrix_impl(UINT const D,
                 case akns_discretization_ES4:
                 case akns_discretization_ES6:
                 case akns_discretization_ES8:
-                    for (UINT n = 0, node=0; n < D; n+=upsampling_factor, node++) {
-                        COMPLEX U[2][2] = {{0}};
+                    for (UINT node=0; node<D/upsampling_factor; ) {
+                        COMPLEX steps[AKNS_SCATTER_ES_BLOCK_SIZE][4];
+                        UINT count = D/upsampling_factor-node;
+                        if (count > AKNS_SCATTER_ES_BLOCK_SIZE)
+                            count = AKNS_SCATTER_ES_BLOCK_SIZE;
                         ret_code = akns_scatter_U_ES(&tmp1[es_numel*node],
-                                es_degree,l_curr,eps_t,pade,0,0,*U);
+                                es_degree,l_curr,eps_t,pade,0,0,steps[0],count);
                         CHECK_RETCODE(ret_code, leave_fun);
-                        akns_scatter_apply_U_ES(&U[0][0],2,
-                                &H[current][0][0],2,&H[!current][0][0],2);
-                        akns_scatter_apply_U_ES(&U[0][0],2,
-                                &H[current][0][1],2,&H[!current][0][1],2);
-                        current = !current;
-                        if (W != NULL)
-                            Wi += akns_scatter_normalize_ES_vector(4,
-                                    &H[current][0][0]);
+                        for (UINT step=0; step<count; step++) {
+                            akns_scatter_apply_U_ES(steps[step],2,
+                                    &H[current][0][0],2,&H[!current][0][0],2);
+                            akns_scatter_apply_U_ES(steps[step],2,
+                                    &H[current][0][1],2,&H[!current][0][1],2);
+                            current = !current;
+                            if (W != NULL)
+                                Wi += akns_scatter_normalize_ES_vector(4,
+                                        &H[current][0][0]);
+                        }
+                        node += count;
                     }
                     if (W != NULL)
                         W[i] = Wi;
@@ -1200,18 +1383,26 @@ static INT akns_scatter_bound_states_impl(UINT const D,
             case akns_discretization_ES4:
             case akns_discretization_ES6:
             case akns_discretization_ES8:
-                for (UINT n=0, n_given=0; n<D; n+=upsampling_factor, n_given++) {
-                    ret_code = akns_scatter_U_ES(&tmp1[es_numel*n_given],
-                            es_degree,l_curr,eps_t,pade,1,0,*U);
+                for (UINT node=0; node<D_given; ) {
+                    COMPLEX steps[AKNS_SCATTER_ES_BLOCK_SIZE][16];
+                    UINT count = D_given-node;
+                    if (count > AKNS_SCATTER_ES_BLOCK_SIZE)
+                        count = AKNS_SCATTER_ES_BLOCK_SIZE;
+                    ret_code = akns_scatter_U_ES(&tmp1[es_numel*node],
+                            es_degree,l_curr,eps_t,pade,1,0,steps[0],count);
                     CHECK_RETCODE(ret_code, leave_fun);
-                    akns_scatter_apply_U_ES_derivative(&U[0][0],
-                            &PHI[4*n_given],&PHI[4*(n_given+1)]);
-                    if (normalization_flag) {
-                        WPHI_acc += akns_scatter_normalize_ES_vector(4,
-                                &PHI[4*(n_given+1)]);
-                        if (WPHI != NULL)
-                            WPHI[n_given+1] = WPHI_acc;
+                    for (UINT step=0; step<count; step++) {
+                        const UINT n_given = node+step;
+                        akns_scatter_apply_U_ES_derivative(steps[step],
+                                &PHI[4*n_given],&PHI[4*(n_given+1)]);
+                        if (normalization_flag) {
+                            WPHI_acc += akns_scatter_normalize_ES_vector(4,
+                                    &PHI[4*(n_given+1)]);
+                            if (WPHI != NULL)
+                                WPHI[n_given+1] = WPHI_acc;
+                        }
                     }
+                    node += count;
                 }
                 break;
 
@@ -1309,19 +1500,25 @@ static INT akns_scatter_bound_states_impl(UINT const D,
                 case akns_discretization_ES4:
                 case akns_discretization_ES6:
                 case akns_discretization_ES8:
-                    for (UINT n_given=D_given; n_given-->0; ) {
-                        COMPLEX U[2][2] = {{0}};
-                        ret_code = akns_scatter_U_ES(
-                                &tmp1[es_numel*n_given],es_degree,l_curr,
-                                eps_t,pade,0,1,*U);
+                    for (UINT end=D_given; end>0; ) {
+                        COMPLEX steps[AKNS_SCATTER_ES_BLOCK_SIZE][4];
+                        const UINT count = end < AKNS_SCATTER_ES_BLOCK_SIZE
+                                ? end : AKNS_SCATTER_ES_BLOCK_SIZE;
+                        const UINT node = end-count;
+                        ret_code = akns_scatter_U_ES(&tmp1[es_numel*node],
+                                es_degree,l_curr,eps_t,pade,0,1,steps[0],count);
                         CHECK_RETCODE(ret_code, leave_fun);
-                        akns_scatter_apply_U_ES(&U[0][0],2,
-                                &PSI[4*(n_given+1)],1,&PSI[4*n_given],1);
-                        if (normalization_flag) {
-                            WPSI_acc += akns_scatter_normalize_ES_vector(2,
-                                    &PSI[4*n_given]);
-                            WPSI[n_given] = WPSI_acc;
+                        for (UINT step=count; step-->0; ) {
+                            const UINT n_given = node+step;
+                            akns_scatter_apply_U_ES(steps[step],2,
+                                    &PSI[4*(n_given+1)],1,&PSI[4*n_given],1);
+                            if (normalization_flag) {
+                                WPSI_acc += akns_scatter_normalize_ES_vector(2,
+                                        &PSI[4*n_given]);
+                                WPSI[n_given] = WPSI_acc;
+                            }
                         }
+                        end = node;
                     }
                     break;
 

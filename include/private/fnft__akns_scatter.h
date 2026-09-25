@@ -36,6 +36,9 @@
 #include <string.h> // for memcpy
 #include "fnft__errwarn.h"
 #include "fnft__misc.h"// for square_matrix_mult
+#if defined(__INTEL_COMPILER) || defined(__INTEL_LLVM_COMPILER)
+#include <mathimf.h>
+#endif
 
 /* Internal exact ES scalar kernel. It is inline so the production scatterer
  * and its direct numerical oracle exercise one implementation without adding
@@ -50,19 +53,47 @@ static inline void fnft__akns_scatter_exact_scalar_pair(
 
     if (isfinite(root_real) && isfinite(root_imag)
             && FNFT_FABS(root_real) <= safe_real_limit) {
-        const FNFT_REAL sin_imag = FNFT_SIN(root_imag);
-        const FNFT_REAL cos_imag = FNFT_COS(root_imag);
-        const FNFT_REAL sinh_real = FNFT_SINH(root_real);
-        const FNFT_REAL cosh_real = FNFT_COSH(root_real);
+        FNFT_REAL sin_imag, cos_imag, sinh_real, cosh_real;
+#if defined(__INTEL_COMPILER) || defined(__INTEL_LLVM_COMPILER)
+        sincos(root_imag,&sin_imag,&cos_imag);
+        sinhcosh(root_real,&sinh_real,&cosh_real);
+#else
+#if defined(__MINGW32__) && defined(__GNUC__) && !defined(__clang__)
+        /* MinGW's paired function uses x87 argument reduction. Restrict
+         * it to small arguments and retain libm's full-range functions. */
+        if (FNFT_FABS(root_imag) <= 1.0) {
+            __builtin_sincos(root_imag,&sin_imag,&cos_imag);
+        } else
+#endif
+        {
+            sin_imag = FNFT_SIN(root_imag);
+            cos_imag = FNFT_COS(root_imag);
+        }
+        /* Both hyperbolic functions share one exponential. Using expm1
+         * retains relative accuracy near zero; the product below avoids
+         * squaring an exponentially large intermediate value. */
+        const FNFT_REAL em1 = expm1(FNFT_FABS(root_real));
+        const FNFT_REAL ratio = em1/(1.0+em1);
+        sinh_real = copysign(0.5*(em1+ratio),root_real);
+        cosh_real = 1.0+0.5*em1*ratio;
+#endif
         const FNFT_COMPLEX f_candidate = cosh_real*cos_imag
                 +(FNFT_COMPLEX)I*(sinh_real*sin_imag);
-        FNFT_COMPLEX g_candidate = (sinh_real*cos_imag
-                +(FNFT_COMPLEX)I*(cosh_real*sin_imag))/root;
+        FNFT_COMPLEX g_candidate;
 
         if (root_real == 0.0 && root_imag != 0.0) {
-            g_candidate = (FNFT_COMPLEX)(sin_imag/root_imag);
-            if (root_imag > 0.0)
-                g_candidate = FNFT_CONJ(g_candidate);
+            /* Reuse sin/cos, but retain the signed zeros of
+             * sin(i*root)/(i*root) on the imaginary axis. */
+            const FNFT_COMPLEX rotated = (FNFT_COMPLEX)I*root;
+            const FNFT_REAL parts[2] = {
+                -sin_imag,cos_imag*FNFT_CIMAG(rotated)
+            };
+            FNFT_COMPLEX numerator;
+            memcpy(&numerator,parts,sizeof(numerator));
+            g_candidate = numerator/rotated;
+        } else {
+            g_candidate = (sinh_real*cos_imag
+                    +(FNFT_COMPLEX)I*(cosh_real*sin_imag))/root;
         }
 
         if (isfinite(FNFT_CREAL(f_candidate))

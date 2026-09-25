@@ -229,6 +229,31 @@ static COMPLEX complex_from_parts(REAL const real, REAL const imag)
     return value;
 }
 
+static INT test_exact_scalar_pair_shared_hyperbolics(void)
+{
+    const REAL re[] = {-700.0,-100.0,-20.0,-1.0,-0.1,-1e-12,-1e-300,
+            -0.0,0.0,1e-300,1e-12,0.1,1.0,20.0,100.0,700.0};
+    const REAL im[] = {-1e6,-3.0,-0.1,-1e-12,-0.0,0.0,1e-12,0.1,3.0,1e6};
+
+    for (UINT i=0; i<sizeof(re)/sizeof(re[0]); i++) {
+        for (UINT j=0; j<sizeof(im)/sizeof(im[0]); j++) {
+            const COMPLEX root = complex_from_parts(re[i],im[j]);
+            const COMPLEX reference[2] = {CCOSH(root),misc_CSINC((COMPLEX)I*root)};
+            COMPLEX actual[2];
+
+            fnft__akns_scatter_exact_scalar_pair(root,&actual[0],&actual[1]);
+            for (UINT k=0; k<2; k++) {
+                const REAL scale = fmax(1.0,fmax(FABS(CREAL(reference[k])),
+                        FABS(CIMAG(reference[k]))));
+                if (!isfinite(CREAL(actual[k])) || !isfinite(CIMAG(actual[k]))
+                        || !(CABS(actual[k]-reference[k]) <= 16*EPSILON*scale))
+                    return E_TEST_FAILED;
+            }
+        }
+    }
+    return SUCCESS;
+}
+
 static INT test_exact_scalar_pair_signed_zeros(void)
 {
     const COMPLEX roots[] = {
@@ -245,6 +270,9 @@ static INT test_exact_scalar_pair_signed_zeros(void)
         complex_from_parts(1.0,1.0),
         complex_from_parts(1.0,-1.0),
         CSQRT(1e300), CSQRT(-1e300),
+        complex_from_parts(-0.0,1e150),
+        complex_from_parts(0.0,-1e150),
+        complex_from_parts(-0.0,-1e150),
         CSQRT(1e300+(COMPLEX)I*1e300),
         complex_from_parts(INFINITY,0.0),
         complex_from_parts(NAN,1.0)
@@ -1217,6 +1245,91 @@ leave_fun:
     return ret_code;
 }
 
+/* Compare complete blocks and partial last blocks with a product of
+ * independently evaluated single-node transitions, including U'. */
+static INT test_slow_ES_block_composition(void)
+{
+    const UINT sizes[] = {2,31,32,33,63,64,65};
+    const nse_discretization_t schemes[] = {
+        nse_discretization_ES4,nse_discretization_ES6,nse_discretization_ES8
+    };
+    const COMPLEX lambda[] = {-0.4,0.6+0.13*(COMPLEX)I};
+    const REAL h = 0.02;
+    COMPLEX samples[65], *q = NULL, *r = NULL;
+    INT ret_code = SUCCESS;
+
+    for (UINT size=0; size<sizeof(sizes)/sizeof(sizes[0]); size++) {
+        const UINT N = sizes[size];
+        for (UINT n=0; n<N; n++) {
+            const REAL t = n*h;
+            samples[n] = 0.3+0.12*SIN(3*t)+0.2*(COMPLEX)I*COS(t);
+        }
+        for (UINT method=0; method<3; method++) {
+            const UINT stride = 2*method+3;
+            for (INT kappa=-1; kappa<=1; kappa+=2) {
+                UINT Dsub = N, first_last[2];
+                ret_code = nse_discretization_preprocess_signal(N,samples,h,
+                        kappa,&Dsub,&q,&r,first_last,schemes[method]);
+                CHECK_RETCODE(ret_code,leave_fun);
+                for (UINT degree=0; degree<=7; degree++) {
+                    for (UINT point=0; point<2; point++) {
+                        COMPLEX reference[8] = {1,0,0,1,0,0,0,0};
+                        for (UINT n=0; n<N; n++) {
+                            COMPLEX U[8], next[8] = {0};
+                            ret_code = test_scatter_matrix(stride,q+stride*n,
+                                    r+stride*n,h,kappa,1,&lambda[point],U,
+                                    NULL,schemes[method],degree,1);
+                            CHECK_RETCODE(ret_code,leave_fun);
+                            for (UINT row=0; row<2; row++) {
+                                for (UINT col=0; col<2; col++) {
+                                    for (UINT k=0; k<2; k++) {
+                                        next[2*row+col] += U[2*row+k]
+                                                *reference[2*k+col];
+                                        next[4+2*row+col] += U[4+2*row+k]
+                                                *reference[2*k+col]
+                                                +U[2*row+k]*reference[4+2*k+col];
+                                    }
+                                }
+                            }
+                            memcpy(reference,next,sizeof(reference));
+                        }
+                        for (UINT derivative=0; derivative<=1; derivative++) {
+                            for (UINT normalize=0; normalize<=1; normalize++) {
+                                COMPLEX actual[8];
+                                INT W = 0;
+                                ret_code = test_scatter_matrix(N*stride,q,r,h,
+                                        kappa,1,&lambda[point],actual,
+                                        normalize ? &W : NULL,schemes[method],
+                                        degree,derivative);
+                                CHECK_RETCODE(ret_code,leave_fun);
+                                for (UINT j=0; j<(derivative ? 8 : 4); j++) {
+                                    const COMPLEX value = actual[j]*POW(2,W);
+                                    const REAL tolerance = 128*(N+1)*EPSILON
+                                            *(1+CABS(reference[j]));
+                                    if (!isfinite(CREAL(value))
+                                            || !isfinite(CIMAG(value))
+                                            || !(CABS(value-reference[j]) <= tolerance)) {
+                                        ret_code = E_TEST_FAILED;
+                                        goto leave_fun;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                free(q);
+                free(r);
+                q = NULL;
+                r = NULL;
+            }
+        }
+    }
+leave_fun:
+    free(q);
+    free(r);
+    return ret_code;
+}
+
 INT main(void)
 {
     const COMPLEX q_bad[6] = {0}, r_bad[6] = {0}, lambda = 0.3;
@@ -1229,6 +1342,8 @@ INT main(void)
     ret_code = test_es_family_traceless_coefficients();
     CHECK_RETCODE(ret_code, failure);
     ret_code = test_exact_scalar_pair_grid();
+    CHECK_RETCODE(ret_code, failure);
+    ret_code = test_exact_scalar_pair_shared_hyperbolics();
     CHECK_RETCODE(ret_code, failure);
     ret_code = test_exact_scalar_pair_signed_zeros();
     CHECK_RETCODE(ret_code, failure);
@@ -1267,6 +1382,8 @@ INT main(void)
     ret_code = test_step(-1,5);
     CHECK_RETCODE(ret_code, failure);
     ret_code = test_all_slow_pade_paths();
+    CHECK_RETCODE(ret_code, failure);
+    ret_code = test_slow_ES_block_composition();
     CHECK_RETCODE(ret_code, failure);
     ret_code = test_slow_ES_normalization_rescaling();
     CHECK_RETCODE(ret_code, failure);
